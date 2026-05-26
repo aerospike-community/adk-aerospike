@@ -99,57 +99,6 @@ scenario-specific:
    Locust against a production-shaped workload on production-shaped hardware
    and measure under your actual concurrency target.
 
-## ADK official-sample validation
-
-Two additional harnesses live alongside the perf benchmark and validate that
-**Google ADK's own sample agents** wire up against our services correctly:
-
-| Script | What it does | Needs LLM API key |
-|---|---|---|
-| `adk_samples_wiring.py` | For a curated set of samples from `google/adk-samples`: imports the agent, constructs `Runner(agent, session_service, artifact_service, memory_service)`, manually drives `create_session → append_event → get_session → add_session_to_memory → search_memory`, reports per-phase pass/fail | ❌ No — pure wiring smoke |
-| `adk_samples_e2e.py` | Same samples, but actually runs one user turn through `Runner.run_async()`. Captures every event the Runner emits, then dumps the Aerospike state | ✅ Yes — `GEMINI_API_KEY` or `GOOGLE_API_KEY` in `.env` |
-
-### Setup
-
-```bash
-# 1. Clone the official ADK sample agents next to this repo:
-git clone --depth 1 https://github.com/google/adk-samples ../adk-samples
-
-# 2. Some samples need extra deps:
-pip install 'a2a-sdk[all]' mcp
-
-# 3. For the E2E script: put your key in .env at the repo root:
-echo "GEMINI_API_KEY=AIza..." > .env   # .env is gitignored
-```
-
-### Run
-
-```bash
-# Phase 1 — wiring only (no LLM cost)
-python benchmarks/adk_samples_wiring.py
-
-# Phase 2 — real LLM turns (small Gemini cost)
-SLACK_MCP_XOXP_TOKEN=dummy python benchmarks/adk_samples_e2e.py
-# (the dummy SLACK token avoids an import-time MCPToolset error in one sample)
-
-# Both accept --uri (cluster) and --samples-path (where you cloned adk-samples).
-```
-
-### Reference outcomes (alpha)
-
-7 representative samples (`fun-facts`, `currency-agent`, `llm-auditor`,
-`parallel_task_decomposition_execution`, `memory-bank`, `customer-service`,
-`blog-writer`) — covering `LlmAgent`, `SequentialAgent`, `ParallelAgent`,
-agents with tools, multi-agent workflows.
-
-- **Wiring**: 6 / 7 pass; 1 fails only because the sample pins old SDK versions
-  (`a2a-sdk==0.3.3`, `google-adk==1.13.0`) incompatible with current installed
-  versions — not an integration issue with us.
-- **E2E**: 3 / 3 pass (fun-facts, llm-auditor, customer-service) — real Gemini
-  events round-trip through chunked-session storage; multi-agent sequential
-  preserves sub-agent event ordering; stateful tool callbacks correctly
-  populate `session.state`.
-
 ## What this harness deliberately does NOT do
 
 - **No mixed workloads.** Use Locust if you want session-create + reads +
