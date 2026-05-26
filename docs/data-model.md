@@ -10,13 +10,13 @@ the package uses these sets (default prefix `adk_`, configurable):
 
 | Set            | Primary key                                                | Purpose                                          |
 | -------------- | ---------------------------------------------------------- | ------------------------------------------------ |
-| `adk_sessions` | `app \x1f user \x1f session` (session record) or `app \x1f user \x1f session \x1f c:NNNNNNNN` (chunk record) | One session record per session; one chunk record per sealed batch of events |
+| `adk_sessions` | `app : user : session` (session record) or `app : user : session : c:NNNNNNNN` (chunk record) | One session record per session; one chunk record per sealed batch of events |
 | `adk_app_state`| `app`                                                      | App-scoped state (`app:` prefixed keys)          |
-| `adk_user_state`| `app \x1f user`                                           | User-scoped state (`user:` prefixed keys)        |
-| `adk_artifacts`| `app \x1f user \x1f session \x1f filename \x1f version:08d` | Versioned binary artifacts                       |
-| `adk_memory`   | `app \x1f user \x1f session \x1f event_id`                 | One row per memory entry                         |
+| `adk_user_state`| `app : user`                                           | User-scoped state (`user:` prefixed keys)        |
+| `adk_artifacts`| `app : user : session : filename : version:08d` | Versioned binary artifacts                       |
+| `adk_memory`   | `app : user : session : event_id`                 | One row per memory entry                         |
 
-`\x1f` is the ASCII unit separator. It is not valid in app/user/session/filename
+`:` is the ASCII unit separator. It is not valid in app/user/session/filename
 inputs from ADK, so no escaping is needed.
 
 ## Bins
@@ -38,7 +38,7 @@ record. See `adk_aerospike._internal.schema.Bins`.
 | `chunks`  | int    | number of sealed chunk records (== next chunk index to write)    |
 | `tbytes`  | int    | estimated size of the tail; flush trigger                        |
 
-### `adk_sessions` — chunk record (key suffix `\x1f c:NNNNNNNN`)
+### `adk_sessions` — chunk record (key suffix `: c:NNNNNNNN`)
 
 | Bin       | Type   | Notes                                                            |
 | --------- | ------ | ---------------------------------------------------------------- |
@@ -120,7 +120,7 @@ no embedder dependency.
 
 | Set            | Primary key                                       | Purpose                         |
 | -------------- | ------------------------------------------------- | ------------------------------- |
-| `adk_memory`   | `app \x1f user \x1f session \x1f event_id`        | One record per memory entry     |
+| `adk_memory`   | `app : user : session : event_id`        | One record per memory entry     |
 
 Bins: `app`, `uid`, `sid`, `eid`, `text`, `keywords` (list[str]), `author`,
 `ts`, `content` (Map — original event content for reconstruction).

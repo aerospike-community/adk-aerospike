@@ -75,7 +75,7 @@ src/adk_aerospike/
 │   ├── client.py        # Aerospike client factory + best-practice policies
 │   ├── codec.py         # Pydantic <-> bin (de)serialization
 │   ├── indexes.py       # Idempotent secondary index creation
-│   ├── keys.py          # PK construction; separator is \x1f
+│   ├── keys.py          # PK construction; separator is :
 │   ├── schema.py        # Schema dataclass, Bins, StateScope constants
 │   └── uri.py           # aerospike:// URI parsing
 ├── sessions/
@@ -158,9 +158,9 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 | Aerospike record | Upstream object | Source citation |
 |---|---|---|
 | `adk_sessions` session record (bins `app, uid, sid, state, events (tail), ts, seq, chunks, tbytes`) | `StorageSession` + inline `events` (denormalised from `StorageEvent`) | `schemas/v1.py:72-103` |
-| `adk_sessions` chunk record (key suffix `\x1fc:08d`, bins `cidx, events, ts_lo, ts_hi`) | Spill-over for `StorageEvent` rows — Aerospike-specific to avoid the 1 MiB write-block-size cap | no upstream parallel — our shape |
+| `adk_sessions` chunk record (key suffix `:c:08d`, bins `cidx, events, ts_lo, ts_hi`) | Spill-over for `StorageEvent` rows — Aerospike-specific to avoid the 1 MiB write-block-size cap | no upstream parallel — our shape |
 | `adk_app_state` row keyed by `"<app>"` | `StorageAppState` — one row per `(app_name)`, prefix stripped | `schemas/v1.py:233-247` + `_session_util.py:44` |
-| `adk_user_state` row keyed by `"<app>\x1f<user>"` | `StorageUserState` — one row per `(app_name, user_id)`, prefix stripped | `schemas/v1.py:249-265` + `_session_util.py:46` |
+| `adk_user_state` row keyed by `"<app>:<user>"` | `StorageUserState` — one row per `(app_name, user_id)`, prefix stripped | `schemas/v1.py:249-265` + `_session_util.py:46` |
 | `temp:*` keys absent from every record | `TEMP_PREFIX` keys are in-process only; never persisted | `state.py:66` + `_session_util.py:48` + `BaseSessionService._trim_temp_delta_state` |
 | Inline event Map inside `events` list (bins `eid, ts, author, content, actions, branch`) | `StorageEvent` row fields | `schemas/v1.py:164-191` (we store same fields in a Map element instead of a row) |
 | `seq` counter on session + atomic increment via `operate` | `_storage_update_marker` optimistic-concurrency intent — stronger here (server-side single-record atomic) | `session.py:53` PrivateAttr |
@@ -178,7 +178,7 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 - Artifact `user:` prefix → sentinel `"user"` in the session-slot (same constraint as upstream: a real session_id of `"user"` would collide — that's an upstream-level constraint we inherit)
 
 **Aerospike primitives instead of SQL primitives — semantically equivalent:**
-- Composite SQL PK → `\x1f`-separated string PK (no escaping needed; `\x1f` is invalid in ADK identifiers)
+- Composite SQL PK → `:`-separated string PK (no escaping needed; `:` is invalid in ADK identifiers)
 - 1:N FK → secondary index on `events.sid`
 - ORM ordering by `timestamp` → explicit `seq:08d` zero-padded suffix (lexicographically sortable, secondary-indexable)
 - Row-update on state delta → single-RTT atomic `map_put_items` Map CDT
@@ -213,13 +213,13 @@ If any of these change in a future ADK release, our backend needs to follow.
 See `docs/data-model.md` for the full spec. Quick reference:
 
 Default set prefix `adk_`. Sets:
-- `adk_sessions` — key `app\x1fuser\x1fsession`, bins `app, uid, sid, state (Map), ts, seq`
-- `adk_events` — key `app\x1fuser\x1fsession\x1fseq:08d`, bins `app, uid, sid, seq, ts, author, content, actions, branch`
+- `adk_sessions` — key `app:user:session`, bins `app, uid, sid, state (Map), ts, seq`
+- `adk_events` — key `app:user:session:seq:08d`, bins `app, uid, sid, seq, ts, author, content, actions, branch`
 - `adk_sessions` (also holds chunks) — see "Chunked session layout" below
 - `adk_app_state` — key `app`, bin `state (Map)`
-- `adk_user_state` — key `app\x1fuser`, bin `state (Map)`
-- `adk_artifacts` — key `app\x1fuser\x1fsession\x1ffname\x1fver:08d`, bins `app, uid, sid, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`).
-- `adk_memory` — key `app\x1fuser\x1fsession\x1fevent_id`, bins `app, uid, sid, eid, text, keywords (list[str]), author, ts, content (Map)`. Lexical word-overlap search runs server-side via Aerospike's list-element secondary index on `keywords`.
+- `adk_user_state` — key `app:user`, bin `state (Map)`
+- `adk_artifacts` — key `app:user:session:fname:ver:08d`, bins `app, uid, sid, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`).
+- `adk_memory` — key `app:user:session:event_id`, bins `app, uid, sid, eid, text, keywords (list[str]), author, ts, content (Map)`. Lexical word-overlap search runs server-side via Aerospike's list-element secondary index on `keywords`.
 
 Indexes (auto-created by `_internal/indexes.py` on service init):
 - `idx_<prefix>sess_uid`, `idx_<prefix>sess_app` on `sessions`
@@ -233,11 +233,11 @@ The `adk_sessions` set holds **two record kinds** in one set, distinguished
 by key shape and bin presence:
 
 **Session record** (mutable, ≤ ~280 KiB):
-- Key: `app\x1fuser\x1fsession`
+- Key: `app:user:session`
 - Bins: `app, uid, sid` (indexed for `list_sessions`), `state (Map)`, `events (List — hot tail)`, `ts`, `seq`, `chunks`, `tbytes`
 
 **Chunk record** (immutable, ~256 KiB):
-- Key: `app\x1fuser\x1fsession\x1fc:NNNNNNNN`
+- Key: `app:user:session:c:NNNNNNNN`
 - Bins: `cidx`, `events (List)`, `ts_lo`, `ts_hi`
 
 Chunks deliberately omit `app/uid/sid` bins, so they don't appear in the

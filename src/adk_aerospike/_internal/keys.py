@@ -6,22 +6,27 @@ string form is what we pass to the client.
 
 Format choices
 --------------
-- Separator is ``"\x1f"`` (ASCII unit separator) — never appears in valid
-  app/user/session/filename inputs, so we don't need escaping.
-- Session record:  ``app \x1f user \x1f session``
-- Chunk record:    ``app \x1f user \x1f session \x1f c:NNNNNNNN`` (8-digit
-  zero-padded; ``c:`` prefix avoids collisions with future sentinels)
+- Separator is ``":"`` — human-readable in ``aql`` and ``aerolab`` CLI tools.
+  ADK identifiers (``app_name``, ``user_id``, ``session_id``) don't contain
+  ``:`` in practice. Filenames CAN contain ``:`` (canonical example: the
+  ``user:`` prefix routes artifacts to a user-scoped slot — see
+  ``artifact_scope_id``). Parsing back to fields is therefore by field count,
+  not by splitting on ``:`` — but Aerospike itself hashes the whole string to
+  a digest, so this only matters for human inspection of keys.
+- Session record:  ``app : user : session``
+- Chunk record:    ``app : user : session : c:NNNNNNNN``  (chunk-index
+  suffix uses ``c:`` to keep it visually distinct from a session id)
 - App-state:       ``app``
-- User-state:      ``app \x1f user``
-- Artifact:        ``app \x1f user \x1f session \x1f filename \x1f version:08d``
-- Memory:          ``app \x1f user \x1f session \x1f event_id``
+- User-state:      ``app : user``
+- Artifact:        ``app : user : session : filename : NNNNNNNN``
+- Memory:          ``app : user : session : event_id``
 """
 
 from __future__ import annotations
 
 from typing import Final
 
-SEP: Final = "\x1f"
+SEP: Final = ":"
 USER_SCOPE_SID: Final = "user"
 """Sentinel session-id slot for user-scoped artifacts.
 

@@ -243,16 +243,16 @@ five sets (default prefix `adk_`):
 
 ### Key format
 
-The primary key separator is `\x1f` (ASCII Unit Separator). It cannot appear
+The primary key separator is `:` (ASCII Unit Separator). It cannot appear
 in valid ADK identifiers, so no escaping is needed.
 
 ```
-adk_sessions       app\x1fuser\x1fsession                     ← session record
-adk_sessions       app\x1fuser\x1fsession\x1fc:NNNNNNNN       ← chunk record
+adk_sessions       app:user:session                     ← session record
+adk_sessions       app:user:session:c:NNNNNNNN       ← chunk record
 adk_app_state      app
-adk_user_state     app\x1fuser
-adk_artifacts      app\x1fuser\x1fscope\x1ffname\x1fNNNNNNNN  ← scope = session_id, or sentinel "user"
-adk_memory         app\x1fuser\x1fsession\x1feventid
+adk_user_state     app:user
+adk_artifacts      app:user:scope:fname:NNNNNNNN  ← scope = session_id, or sentinel "user"
+adk_memory         app:user:session:eventid
 ```
 
 `POLICY_KEY_SEND` is enabled on every operation — the actual key string is
@@ -376,7 +376,7 @@ needed.** This is one of the cleanest design wins.
 
 **Flush path** — every ~320 events. Two operations:
 
-1. PUT chunk record at key `…\x1fc:NNNNNNNN` (overwrites any orphan from a
+1. PUT chunk record at key `…:c:NNNNNNNN` (overwrites any orphan from a
    prior interrupted flush).
 2. Generation-checked `operate()` on session record: clear tail, increment
    `chunks` counter, reset `tbytes` to 0.
@@ -428,7 +428,7 @@ Scenario: app `support_bot`, user `alice`, session `s-2026-05-22-xyz`.
 
 ```
 SET:  adk_sessions
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz"
+KEY:  "support_bot:alice:s-2026-05-22-xyz"
 bins:
   app:     "support_bot"
   uid:     "alice"
@@ -441,7 +441,7 @@ bins:
   tbytes:  0
 
 SET:  adk_app_state                  SET:  adk_user_state
-KEY:  "support_bot"                  KEY:  "support_bot\x1falice"
+KEY:  "support_bot"                  KEY:  "support_bot:alice"
 bins:                                bins:
   state: {"tenant": "acme-corp"}       state: {"nickname": "Allie"}
 ```
@@ -450,7 +450,7 @@ bins:                                bins:
 
 ```
 SET:  adk_sessions
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz"
+KEY:  "support_bot:alice:s-2026-05-22-xyz"
 bins:
   app:     "support_bot"
   uid:     "alice"
@@ -477,7 +477,7 @@ bins:
 
 ```
 SET:  adk_sessions
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz"   ← session record (tail reset)
+KEY:  "support_bot:alice:s-2026-05-22-xyz"   ← session record (tail reset)
 bins:
   app:     "support_bot"
   uid:     "alice"
@@ -492,7 +492,7 @@ bins:
   tbytes:  412
 
 SET:  adk_sessions
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz\x1fc:00000000"   ← chunk record
+KEY:  "support_bot:alice:s-2026-05-22-xyz:c:00000000"   ← chunk record
 bins:
   cidx:    0
   events:  [
@@ -513,7 +513,7 @@ bins, so chunks stay invisible to `list_sessions`.
 
 ```
 SET:  adk_artifacts
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz\x1freceipt.png\x1f00000000"
+KEY:  "support_bot:alice:s-2026-05-22-xyz:receipt.png:00000000"
 bins:
   app, uid, sid, fname, ver, mime
   data:   <bytes — PNG payload>
@@ -526,7 +526,7 @@ session slot, matching `InMemoryArtifactService`'s path scheme):
 
 ```
 SET:  adk_artifacts
-KEY:  "support_bot\x1falice\x1fuser\x1fuser:avatar.jpg\x1f00000000"
+KEY:  "support_bot:alice:user:user:avatar.jpg:00000000"
 bins: ... sid="user" ...
 ```
 
@@ -534,7 +534,7 @@ bins: ... sid="user" ...
 
 ```
 SET:  adk_memory
-KEY:  "support_bot\x1falice\x1fs-2026-05-22-xyz\x1fev_d4f2c1"
+KEY:  "support_bot:alice:s-2026-05-22-xyz:ev_d4f2c1"
 bins:
   app, uid, sid, eid, author, ts
   text:    "Paid May 18."
@@ -650,7 +650,7 @@ architectural decision.
 
 Key shape:
 ```
-adk_artifacts   app\x1fuser\x1fscope\x1ffname\x1fNNNNNNNN
+adk_artifacts   app:user:scope:fname:NNNNNNNN
 ```
 
 The version is part of the primary key. So:

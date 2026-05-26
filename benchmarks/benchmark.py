@@ -284,10 +284,11 @@ async def bench_search(
     app = "bench_search"
     user = "u"
 
-    vocabulary = (
-        "alpha bravo charlie delta echo foxtrot golf hotel india juliet "
-        "kilo lima mike november oscar papa quebec romeo sierra tango"
-    ).split()
+    # Realistic vocabulary scale: each query token should match a small fraction
+    # of the corpus, not 20% (which was the case with a 20-word vocabulary +
+    # 4 tokens/event). 256 words × 8 tokens/event ≈ 3% match rate per token.
+    vocabulary = [f"w{i:04d}" for i in range(256)]
+    tokens_per_event = 8
 
     try:
         # Quick purge: remove all memories for this (app, user) via the service's
@@ -298,7 +299,12 @@ async def bench_search(
         # vocabulary tokens. Distinct event IDs ensure distinct memory rows.
         events: list[Event] = []
         for i in range(corpus):
-            words = " ".join(vocabulary[(i + j) % len(vocabulary)] for j in range(4))
+            # Sample tokens_per_event distinct vocabulary words for this event.
+            # Stride by a prime so consecutive events don't share many tokens.
+            words = " ".join(
+                vocabulary[(i * 17 + j) % len(vocabulary)]
+                for j in range(tokens_per_event)
+            )
             ev = _event(words, i)
             ev.id = f"bench-{i:08d}"
             events.append(ev)

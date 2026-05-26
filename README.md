@@ -320,16 +320,16 @@ adk web \
 Five sets in a single namespace (default prefix `adk_`):
 
 ```
-adk_sessions      app\x1fuser\x1fsession                ← session record (state + hot tail)
-                  app\x1fuser\x1fsession\x1fc:NNNNNNNN  ← sealed chunk record (older events)
+adk_sessions      app:user:session                ← session record (state + hot tail)
+                  app:user:session:c:NNNNNNNN  ← sealed chunk record (older events)
 
 adk_app_state     app                                   ← one per (app)
-adk_user_state    app\x1fuser                           ← one per (app, user)
+adk_user_state    app:user                           ← one per (app, user)
 
-adk_artifacts     app\x1fuser\x1fsession\x1ffname\x1fNNNNNNNN
-                  app\x1fuser\x1fuser\x1fuser:fname\x1fNNNNNNNN   ← user-scoped (sentinel "user")
+adk_artifacts     app:user:session:fname:NNNNNNNN
+                  app:user:user:user:fname:NNNNNNNN   ← user-scoped (sentinel "user")
 
-adk_memory        app\x1fuser\x1fsession\x1feventid
+adk_memory        app:user:session:eventid
                   bins include keywords: list[str], indexed via list-element
                   secondary index for server-side word-overlap search
 ```
