@@ -92,3 +92,18 @@ def artifact_scope_id(filename: str, session_id: str | None) -> str:
 
 def memory_key(app_name: str, user_id: str, session_id: str, event_id: str) -> str:
     return f"{app_name}{SEP}{user_id}{SEP}{session_id}{SEP}{event_id}"
+
+
+def scope_tuple(app_name: str, user_id: str, scope_id: str) -> str:
+    """Composite ``app:user:scope`` value for the denormalised ``aus`` bin.
+
+    Stored as a string so a single secondary-index lookup returns *only* rows
+    in this tenant slot — avoids the "fetch by filename then filter
+    (app, user) in Python" pattern, which scans every other tenant's rows
+    sharing that filename.
+
+    ``scope_id`` is the session id for session-scoped artifacts/memories, the
+    ``USER_SCOPE_SID`` sentinel for user-scoped artifacts, or just the
+    session id for memories (which are always session-scoped).
+    """
+    return f"{app_name}{SEP}{user_id}{SEP}{scope_id}"

@@ -129,6 +129,11 @@ class Bins:
     TEXT: Final = "text"
     KEYWORDS: Final = "keywords"
 
+    # Composite "app:user:scope" bin — denormalised so secondary-index queries
+    # can target a single tenant slot instead of scanning all rows that share
+    # a filename / user. See ``keys.scope_tuple``.
+    SCOPE_TUPLE: Final = "aus"
+
     # Chunked-session bins
     EVENTS: Final = "events"
     CHUNKS: Final = "chunks"

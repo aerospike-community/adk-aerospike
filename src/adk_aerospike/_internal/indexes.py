@@ -57,13 +57,22 @@ def ensure_session_indexes(client: aerospike.Client, schema: Schema) -> None:
 
 
 def ensure_artifact_indexes(client: aerospike.Client, schema: Schema) -> None:
-    """Create secondary indexes used by the ArtifactService. Idempotent."""
+    """Create secondary indexes used by the ArtifactService. Idempotent.
+
+    The ``aus`` (app:user:scope) composite index is the load-bearing one — it
+    lets ``list_artifact_keys`` and ``_rows_for`` target a single tenant slot
+    without a sec-index-then-Python-filter scan over unrelated tenants'
+    artifacts. The ``fname`` index is retained for direct filename lookups
+    and to enable mixed predicate queries (currently AND-narrowing happens
+    client-side by reading ``aus`` rows and filtering by filename).
+    """
     import aerospike
     from aerospike import exception as ae
 
     indexes = (
-        # used by list_artifact_keys / list_versions
-        (schema.artifacts_set, "sid", "string", f"idx_{schema.set_prefix}art_sid"),
+        # Composite tenant index — used by list_artifact_keys / _rows_for.
+        (schema.artifacts_set, "aus", "string", f"idx_{schema.set_prefix}art_aus"),
+        # Filename index — kept for completeness / direct filename queries.
         (schema.artifacts_set, "fname", "string", f"idx_{schema.set_prefix}art_fname"),
     )
 
@@ -88,25 +97,26 @@ def ensure_memory_indexes(client: aerospike.Client, schema: Schema) -> None:
       canonical Aerospike pattern for tag/keyword search; see Aerospike 3.8
       release notes and the "Query JSON Documents Faster with New CDT
       Indexing" blog.
-    - ``idx_<prefix>mem_uid`` — scalar string index on ``uid``. Used by
-      ``add_session_to_memory``'s purge step to find stale memories from a
-      prior add of the same session.
+    - ``idx_<prefix>mem_aus`` — scalar string index on the composite
+      ``app:user:session`` bin. Used by ``add_session_to_memory``'s purge
+      step to find prior memories for this exact session — narrower than a
+      ``uid``-only index, which scans all sessions for that user.
     """
     import aerospike
     from aerospike import exception as ae
 
-    # uid scalar index — for the purge query
+    # Composite (app:user:session) scope index — for the purge query.
     try:
         client.index_single_value_create(
             schema.namespace,
             schema.memory_set,
-            "uid",
+            "aus",
             aerospike.INDEX_STRING,
-            f"idx_{schema.set_prefix}mem_uid",
+            f"idx_{schema.set_prefix}mem_aus",
         )
-        log.info("Created scalar index idx_%smem_uid", schema.set_prefix)
+        log.info("Created scalar index idx_%smem_aus", schema.set_prefix)
     except ae.IndexFoundError:
-        log.debug("idx_%smem_uid already exists", schema.set_prefix)
+        log.debug("idx_%smem_aus already exists", schema.set_prefix)
 
     # keywords list-element index — for keyword search
     try:

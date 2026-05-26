@@ -218,14 +218,20 @@ Default set prefix `adk_`. Sets:
 - `adk_sessions` (also holds chunks) — see "Chunked session layout" below
 - `adk_app_state` — key `app`, bin `state (Map)`
 - `adk_user_state` — key `app:user`, bin `state (Map)`
-- `adk_artifacts` — key `app:user:session:fname:ver:08d`, bins `app, uid, sid, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`).
-- `adk_memory` — key `app:user:session:event_id`, bins `app, uid, sid, eid, text, keywords (list[str]), author, ts, content (Map)`. Lexical word-overlap search runs server-side via Aerospike's list-element secondary index on `keywords`.
+- `adk_artifacts` — key `app:user:session:fname:ver:08d`, bins `app, uid, sid, aus, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`). `aus = "app:user:sid"` is the composite tenant index bin.
+- `adk_memory` — key `app:user:session:event_id`, bins `app, uid, sid, aus, eid, text, keywords (list[str]), author, ts, content (Map)`. Lexical word-overlap search runs server-side via Aerospike's list-element secondary index on `keywords`. `aus = "app:user:session"` narrows the purge query to one session.
 
 Indexes (auto-created by `_internal/indexes.py` on service init):
 - `idx_<prefix>sess_uid`, `idx_<prefix>sess_app` on `sessions`
-- `idx_<prefix>art_sid`, `idx_<prefix>art_fname` on `artifacts`
-- `idx_<prefix>mem_uid` on `memory` (scalar, for purge query)
+- `idx_<prefix>art_aus` (composite `app:user:scope`) and `idx_<prefix>art_fname` on `artifacts`
+- `idx_<prefix>mem_aus` (composite `app:user:session`, for purge) on `memory`
 - `idx_<prefix>mem_kw` on `memory.keywords` (list-element index, for search)
+
+The composite `aus` indexes on `artifacts` and `memory` are load-bearing for
+multi-tenant deployments — they let a tenant-scoped query (e.g. "list
+artifacts for app A, user B, session C") return only matching rows in one
+sec-index hop, instead of the sec-index-then-Python-filter pattern that
+scales linearly in unrelated tenants' rows.
 
 ### Chunked session layout
 

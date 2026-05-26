@@ -5,7 +5,7 @@ Chunked storage layout
 All event history lives **inline on the session record** in an ``events`` List
 CDT bin (the "hot tail"). When the tail exceeds a byte threshold (default 256
 KiB), it is sealed atomically into a sibling chunk record keyed
-``<session_pk>\\x1fc:00000000`` and the tail is reset. Reads concatenate sealed
+``<session_pk>:c:00000000`` and the tail is reset. Reads concatenate sealed
 chunks (in cidx order) with the live tail; only the chunks needed to satisfy
 ``GetSessionConfig`` are fetched, using server-side ``list_get_by_index_range``
 pagination to avoid pulling whole chunks for ``num_recent_events``.
@@ -423,8 +423,13 @@ class AerospikeSessionService(BaseSessionService):
             Bins.TS_LO: ts_lo,
             Bins.TS_HI: ts_hi,
         }
-        # Overwrite any orphan from a previous interrupted flush. Safe because
-        # readers ignore chunks at cidx >= session.chunks.
+        # Plain PUT — intentionally upsert, not POLICY_EXISTS_CREATE. This is
+        # the asymmetry that makes the flush invariant work: session create
+        # rejects duplicates (POLICY_EXISTS_CREATE), but chunk PUT must
+        # overwrite any orphan left by a prior interrupted flush so the next
+        # flush can claim the same cidx cleanly. Readers ignore chunks at
+        # cidx >= session.chunks, so an orphan never appears in history; the
+        # overwrite simply reclaims its slot.
         await asyncio.to_thread(self._client.put, chunk_pk, chunk_bins)
 
         # Reset session tail atomically with generation check. If another

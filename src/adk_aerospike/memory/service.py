@@ -39,7 +39,7 @@ from google.adk.memory.memory_entry import MemoryEntry
 from .._internal.client import close_client, make_client
 from .._internal.codec import extract_event_text
 from .._internal.indexes import ensure_memory_indexes
-from .._internal.keys import memory_key
+from .._internal.keys import memory_key, scope_tuple
 from .._internal.schema import Bins, Schema
 from .._internal.uri import parse as parse_uri
 
@@ -172,6 +172,7 @@ class AerospikeMemoryService(BaseMemoryService):
             Bins.APP_NAME: app_name,
             Bins.USER_ID: user_id,
             Bins.SESSION_ID: session_id,
+            Bins.SCOPE_TUPLE: scope_tuple(app_name, user_id, session_id),
             Bins.EVENT_ID: event.id,
             Bins.TEXT: text,
             Bins.KEYWORDS: keywords,
@@ -205,26 +206,32 @@ class AerospikeMemoryService(BaseMemoryService):
     async def _purge_session_memories(
         self, app_name: str, user_id: str, session_id: str
     ) -> None:
+        """Delete all memory rows for one (app, user, session) tuple.
+
+        Uses the composite ``aus`` (app:user:session) sec-index so the query
+        returns only this session's memories — no scan over the user's other
+        sessions, no scan over other apps that happen to share user ids.
+        """
         from aerospike import exception as ae
         from aerospike import predicates
 
         query = self._client.query(self._schema.namespace, self._schema.memory_set)
-        query.where(predicates.equals(Bins.USER_ID, user_id))
+        query.where(
+            predicates.equals(
+                Bins.SCOPE_TUPLE, scope_tuple(app_name, user_id, session_id)
+            )
+        )
         records = await asyncio.to_thread(query.results)
         for _, _, bins in records:
-            if (
-                bins.get(Bins.APP_NAME) == app_name
-                and bins.get(Bins.SESSION_ID) == session_id
-            ):
-                pk = (
-                    self._schema.namespace,
-                    self._schema.memory_set,
-                    memory_key(app_name, user_id, session_id, bins[Bins.EVENT_ID]),
-                )
-                try:
-                    await asyncio.to_thread(self._client.remove, pk)
-                except ae.RecordNotFound:
-                    pass
+            pk = (
+                self._schema.namespace,
+                self._schema.memory_set,
+                memory_key(app_name, user_id, session_id, bins[Bins.EVENT_ID]),
+            )
+            try:
+                await asyncio.to_thread(self._client.remove, pk)
+            except ae.RecordNotFound:
+                pass
 
 
 def _tokenize(text: str) -> list[str]:

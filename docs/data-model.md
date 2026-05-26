@@ -16,8 +16,14 @@ the package uses these sets (default prefix `adk_`, configurable):
 | `adk_artifacts`| `app : user : session : filename : version:08d` | Versioned binary artifacts                       |
 | `adk_memory`   | `app : user : session : event_id`                 | One row per memory entry                         |
 
-`:` is the ASCII unit separator. It is not valid in app/user/session/filename
-inputs from ADK, so no escaping is needed.
+`:` is the field separator. ADK identifiers (`app_name`, `user_id`,
+`session_id`, `event_id`) never contain `:` in practice. **Filenames are the
+one exception** — the canonical `user:` prefix routes an artifact to a
+user-scoped slot (handled in Python by `artifact_scope_id()` *before* key
+construction; the `:` ends up inside one field, not as a delimiter). We
+never parse keys back into fields — Aerospike hashes the whole string into
+a RIPEMD-160 digest — so the `:` inside a filename is invisible at the
+storage layer.
 
 ## Bins
 
@@ -37,6 +43,36 @@ record. See `adk_aerospike._internal.schema.Bins`.
 | `seq`     | int    | monotonic counter — total events ever appended                   |
 | `chunks`  | int    | number of sealed chunk records (== next chunk index to write)    |
 | `tbytes`  | int    | estimated size of the tail; flush trigger                        |
+
+### `adk_artifacts`
+
+| Bin       | Type   | Notes                                                            |
+| --------- | ------ | ---------------------------------------------------------------- |
+| `app`     | str    | denormalised                                                     |
+| `uid`     | str    | denormalised                                                     |
+| `sid`     | str    | session id (or `"user"` sentinel for `user:`-prefixed filenames) |
+| `aus`     | str    | composite `app:user:sid` — sec-indexed for tenant-local listing  |
+| `fname`   | str    | filename (may contain `:`)                                       |
+| `ver`     | int    | version number                                                   |
+| `mime`    | str    | MIME type                                                        |
+| `data`    | bytes  | payload                                                          |
+| `ctime`   | float  | creation time                                                    |
+| `cmeta`   | Map    | custom metadata                                                  |
+
+### `adk_memory`
+
+| Bin       | Type      | Notes                                                            |
+| --------- | --------- | ---------------------------------------------------------------- |
+| `app`     | str       | denormalised                                                     |
+| `uid`     | str       | denormalised                                                     |
+| `sid`     | str       | session id                                                       |
+| `aus`     | str       | composite `app:user:sid` — sec-indexed for purge                 |
+| `eid`     | str       | event id                                                         |
+| `text`    | str       | extracted text content                                           |
+| `keywords`| list[str] | tokenized — list-element sec-indexed for `search_memory`         |
+| `author`  | str       | event author                                                     |
+| `ts`      | float     | event timestamp                                                  |
+| `content` | Map       | full event content (for reconstruction)                          |
 
 ### `adk_sessions` — chunk record (key suffix `: c:NNNNNNNN`)
 
@@ -89,13 +125,21 @@ because the tail still holds the events until the gen-checked reset commits.
 
 Required for the operations below; create on first connect (idempotent).
 
-| Index name             | Set            | Bin     | Type      | Used by              |
-| ---------------------- | -------------- | ------- | --------- | -------------------- |
-| `idx_<prefix>sess_uid` | `adk_sessions` | `uid`   | string    | `list_sessions(user_id=…)` |
-| `idx_<prefix>sess_app` | `adk_sessions` | `app`   | string    | `list_sessions(app_name=…)` |
-| `idx_<prefix>art_sid`  | `adk_artifacts`| `sid`   | string    | `list_artifact_keys` |
-| `idx_<prefix>art_fname`| `adk_artifacts`| `fname` | string    | `list_versions` / `load_artifact` |
-| `idx_<prefix>mem_uid`  | `adk_memory`   | `uid`   | string    | `search_memory` pre-filter |
+| Index name              | Set            | Bin     | Type      | Used by              |
+| ----------------------- | -------------- | ------- | --------- | -------------------- |
+| `idx_<prefix>sess_uid`  | `adk_sessions` | `uid`   | string    | `list_sessions(user_id=…)` |
+| `idx_<prefix>sess_app`  | `adk_sessions` | `app`   | string    | `list_sessions(app_name=…)` |
+| `idx_<prefix>art_aus`   | `adk_artifacts`| `aus`   | string    | `list_artifact_keys` / `list_versions` / `load_artifact` (composite app:user:scope) |
+| `idx_<prefix>art_fname` | `adk_artifacts`| `fname` | string    | direct filename lookups (kept for completeness) |
+| `idx_<prefix>mem_aus`   | `adk_memory`   | `aus`   | string    | `add_session_to_memory` purge step (composite app:user:session) |
+| `idx_<prefix>mem_kw`    | `adk_memory`   | `keywords` | list-element string | `search_memory` keyword lookup |
+
+**Composite tenant indexes (`aus` = "app:user:scope")** are the load-bearing
+ones for artifacts and memory. They narrow secondary-index queries to a single
+tenant slot in a single hop, so a multi-tenant install doesn't pay a scan
+proportional to total cluster traffic just to list one user's artifacts. The
+`fname` / `uid` indexes alone would force a sec-index-then-Python-filter
+pattern with scan amplification linear in unrelated tenants' data.
 
 ## State scoping (`app:` / `user:` / `temp:` prefixes)
 
