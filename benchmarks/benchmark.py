@@ -138,7 +138,7 @@ async def _purge_app(svc: AerospikeSessionService, app: str, user: str) -> None:
 # ---------- 1. append --------------------------------------------------------
 
 
-async def bench_append(uri: str, ops: int, concurrency: int, event_text_size: int) -> Stats:
+async def bench_append(uri: str, ops: int, concurrency: int, event_text_size: int, cleanup: bool = False) -> Stats:
     """Append ``ops`` events across ``concurrency`` parallel sessions.
 
     Validates: append_event is a single-record server-side atomic op. Latency
@@ -160,7 +160,8 @@ async def bench_append(uri: str, ops: int, concurrency: int, event_text_size: in
 
         stats = await _run_concurrent(append_op, ops, concurrency)
         stats.label = f"append (size={event_text_size}B, concurrency={concurrency})"
-        await _purge_app(svc, app, user)
+        if cleanup:
+            await _purge_app(svc, app, user)
         return stats
     finally:
         svc.close()
@@ -169,7 +170,7 @@ async def bench_append(uri: str, ops: int, concurrency: int, event_text_size: in
 # ---------- 2. chunking ------------------------------------------------------
 
 
-async def bench_chunking(uri: str, events: int, event_text_size: int) -> Stats:
+async def bench_chunking(uri: str, events: int, event_text_size: int, cleanup: bool = False) -> Stats:
     """Append ``events`` events to a SINGLE session, observing flush behaviour.
 
     Validates: chunking keeps each append cheap; flushes show up as periodic
@@ -199,7 +200,8 @@ async def bench_chunking(uri: str, events: int, event_text_size: int) -> Stats:
             samples_ms=samples,
             elapsed_s=elapsed,
         )
-        await _purge_app(svc, app, user)
+        if cleanup:
+            await _purge_app(svc, app, user)
         return stats
     finally:
         svc.close()
@@ -214,6 +216,7 @@ async def bench_read(
     ops: int,
     concurrency: int,
     full_history: bool,
+    cleanup: bool = False,
 ) -> Stats:
     """Repeatedly get_session() on a session with ``chunks`` sealed chunks.
 
@@ -259,7 +262,8 @@ async def bench_read(
         stats.label = (
             f"get_session [{mode}] (~{chunks} chunks, concurrency={concurrency})"
         )
-        await _purge_app(svc, app, user)
+        if cleanup:
+            await _purge_app(svc, app, user)
         return stats
     finally:
         svc.close()
@@ -355,21 +359,22 @@ async def run(args: argparse.Namespace) -> None:
     if "append" in scenarios:
         print("[1/4] append")
         stats = await bench_append(
-            args.uri, args.ops, args.concurrency, args.event_size
+            args.uri, args.ops, args.concurrency, args.event_size, args.cleanup
         )
         print(stats.render())
         print()
 
     if "chunking" in scenarios:
         print("[2/4] chunking")
-        stats = await bench_chunking(args.uri, args.events, args.event_size)
+        stats = await bench_chunking(args.uri, args.events, args.event_size, args.cleanup)
         print(stats.render())
         print()
 
     if "read" in scenarios:
         print("[3/4] read")
         stats = await bench_read(
-            args.uri, args.chunks, args.ops, args.concurrency, args.full_history
+            args.uri, args.chunks, args.ops, args.concurrency,
+            args.full_history, args.cleanup,
         )
         print(stats.render())
         print()
@@ -394,6 +399,8 @@ def main() -> None:
     p.add_argument("--chunks", type=int, default=10, help="sealed chunks to build (read)")
     p.add_argument("--full-history", action="store_true",
                    help="read scenario: walk all chunks instead of fast-path tail (read)")
+    p.add_argument("--cleanup", action="store_true",
+                   help="delete benchmark data after the run (default: leave it for inspection)")
     p.add_argument("--corpus", type=int, default=5000, help="memory entries to preload (search)")
     p.add_argument("--query-tokens", type=int, default=3, help="tokens per search query")
     asyncio.run(run(p.parse_args()))
