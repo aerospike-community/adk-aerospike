@@ -32,6 +32,24 @@ Some samples need extra deps. Install on demand:
 Some samples have import-time side effects requiring env vars (e.g.
 ``parallel_task_decomposition_execution`` constructs an MCPToolset reading
 ``SLACK_MCP_XOXP_TOKEN``). Set a dummy value or skip the sample.
+
+Compat shims (applied automatically by this script)
+---------------------------------------------------
+Several official samples have import-time hooks that fail in a clean
+environment because they expect Google Cloud or A2A SDK paths that aren't
+relevant to a wiring smoke test. We patch them at import time so the
+sample's ``root_agent`` can be constructed:
+
+  * ``google.auth.default`` is stubbed to return dummy credentials so
+    Vertex-coupled samples (memory-bank, customer-service, blog-writer)
+    don't fail at module-load with ``DefaultCredentialsError``.
+  * ``google.adk.a2a.utils.agent_to_a2a.to_a2a`` is stubbed to a no-op so
+    samples that call it (currency-agent) can import despite the newer
+    ``a2a-sdk`` reshuffling.
+
+These shims only let the IMPORT succeed; they do NOT make the underlying
+Vertex / A2A functionality work. For an actual end-to-end run against the
+LLM, sample-specific credentials would still be required.
 """
 
 from __future__ import annotations
@@ -42,7 +60,36 @@ import importlib
 import os
 import sys
 import traceback
+import types
 from pathlib import Path
+
+
+def _apply_compat_shims() -> None:
+    """Make broken-or-Vertex-coupled samples importable for the wiring smoke test.
+
+    Only patches at IMPORT time — runtime calls into Vertex / A2A would still
+    need real credentials. We don't make those calls in this smoke test.
+    """
+    # Vertex-coupled samples (memory-bank, customer-service, blog-writer)
+    # call google.auth.default() during their Vertex client construction at
+    # module import time. Stub it.
+    try:
+        import google.auth
+        google.auth.default = lambda *a, **k: ((None, None), "dummy-project")
+    except Exception:
+        pass
+
+    # currency-agent imports google.adk.a2a.utils.agent_to_a2a.to_a2a, which
+    # in turn imports a2a.server.apps — a module path that exists in
+    # a2a-sdk 0.3.x but moved in 1.0+. Stub the public symbol so the sample
+    # can construct its (unused for our purposes) a2a_app variable.
+    if "google.adk.a2a.utils.agent_to_a2a" not in sys.modules:
+        fake = types.ModuleType("google.adk.a2a.utils.agent_to_a2a")
+        fake.to_a2a = lambda *a, **k: None  # type: ignore[attr-defined]
+        sys.modules.setdefault("google.adk.a2a", types.ModuleType("google.adk.a2a"))
+        sys.modules.setdefault("google.adk.a2a.utils",
+                               types.ModuleType("google.adk.a2a.utils"))
+        sys.modules["google.adk.a2a.utils.agent_to_a2a"] = fake
 
 # Default path: ../adk-samples relative to this script's repo root.
 _DEFAULT_SAMPLES = str(Path(__file__).resolve().parent.parent.parent / "adk-samples")
@@ -174,6 +221,8 @@ async def main(args: argparse.Namespace) -> None:
         print(f"ERROR: {samples_root}/python/agents not found. "
               f"Clone the samples repo there or pass --samples-path.")
         sys.exit(2)
+
+    _apply_compat_shims()
 
     samples = discover_samples(samples_root)
     print(f"adk-aerospike × adk-samples wiring smoke test")

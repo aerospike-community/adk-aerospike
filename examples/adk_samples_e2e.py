@@ -32,10 +32,33 @@ import asyncio
 import importlib
 import os
 import sys
+import types
 from pathlib import Path
 
 import aerospike
 from dotenv import load_dotenv
+
+
+def _apply_compat_shims() -> None:
+    """Make broken-or-Vertex-coupled samples importable.
+
+    Same shims as ``adk_samples_wiring.py``. See that file's docstring for
+    rationale. Note: these only patch IMPORT-time hooks; runtime calls into
+    Vertex / A2A still need real credentials, so the E2E phase may fail for
+    samples that actually invoke Vertex at run time (e.g. memory-bank).
+    """
+    try:
+        import google.auth
+        google.auth.default = lambda *a, **k: ((None, None), "dummy-project")
+    except Exception:
+        pass
+    if "google.adk.a2a.utils.agent_to_a2a" not in sys.modules:
+        fake = types.ModuleType("google.adk.a2a.utils.agent_to_a2a")
+        fake.to_a2a = lambda *a, **k: None  # type: ignore[attr-defined]
+        sys.modules.setdefault("google.adk.a2a", types.ModuleType("google.adk.a2a"))
+        sys.modules.setdefault("google.adk.a2a.utils",
+                               types.ModuleType("google.adk.a2a.utils"))
+        sys.modules["google.adk.a2a.utils.agent_to_a2a"] = fake
 
 
 # Default to ../adk-samples relative to the adk-aerospike repo root.
@@ -189,6 +212,8 @@ async def main(args: argparse.Namespace) -> None:
         print("ERROR: GOOGLE_API_KEY (or GEMINI_API_KEY) not set. "
               f"Add it to {_REPO_ROOT/'.env'} or your shell environment.")
         sys.exit(1)
+
+    _apply_compat_shims()
 
     samples_root = Path(args.samples_path).resolve()
     if not (samples_root / "python" / "agents").exists():
