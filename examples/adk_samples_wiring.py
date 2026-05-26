@@ -21,9 +21,9 @@ First clone the official samples repo somewhere (default ../adk-samples):
 
 Then run (from the adk-aerospike repo root):
 
-    python benchmarks/adk_samples_wiring.py
-    python benchmarks/adk_samples_wiring.py --samples-path /path/to/adk-samples
-    python benchmarks/adk_samples_wiring.py --uri aerospike://my-cluster:3000/Test
+    python examples/adk_samples_wiring.py
+    python examples/adk_samples_wiring.py --samples-path /path/to/adk-samples
+    python examples/adk_samples_wiring.py --uri aerospike://my-cluster:3000/Test
 
 Some samples need extra deps. Install on demand:
 

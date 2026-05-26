@@ -20,8 +20,8 @@ Usage
 2. Create .env at repo root with at least:
      GEMINI_API_KEY=AIza...    # or GOOGLE_API_KEY=
 3. Run:
-     python benchmarks/adk_samples_e2e.py
-     python benchmarks/adk_samples_e2e.py --samples-path /path/to/adk-samples \
+     python examples/adk_samples_e2e.py
+     python examples/adk_samples_e2e.py --samples-path /path/to/adk-samples \
                                           --uri aerospike://my-cluster:3000/Test
 """
 
