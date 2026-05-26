@@ -496,3 +496,387 @@ async def test_delete_session_cascades_to_events(
     )
     assert fresh is not None
     assert fresh.events == []
+
+
+# ---- additional path coverage ------------------------------------------------
+
+
+async def test_mixed_scope_state_partitions_correctly(
+    session_service: AerospikeSessionService,
+) -> None:
+    """A single create with app:/user:/session/temp: keys must route each to
+    its own set and drop temp."""
+    s = await session_service.create_session(
+        app_name="mixapp",
+        user_id="alice",
+        state={
+            "session_only": 1,
+            "app:shared": "A",
+            "user:nick": "Allie",
+            "temp:scratch": "drop",
+        },
+    )
+    fetched = await session_service.get_session(
+        app_name="mixapp", user_id="alice", session_id=s.id
+    )
+    assert fetched is not None
+    assert fetched.state == {
+        "session_only": 1,
+        "app:shared": "A",
+        "user:nick": "Allie",
+    }
+
+
+async def test_state_delta_via_append_event_writes_all_scopes(
+    session_service: AerospikeSessionService,
+) -> None:
+    """state_delta on append_event must reach app/user/session sets and not
+    leak temp keys."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    s = await session_service.create_session(
+        app_name="deltaapp", user_id="alice", session_id="ds-1"
+    )
+    await session_service.append_event(
+        s,
+        Event(
+            invocation_id="i",
+            author="user",
+            content=genai_types.Content(
+                role="user", parts=[genai_types.Part(text="x")]
+            ),
+            actions=EventActions(
+                state_delta={
+                    "k": "session-val",
+                    "app:tenant": "acme",
+                    "user:lang": "en",
+                    "temp:secret": "no",
+                }
+            ),
+        ),
+    )
+    fetched = await session_service.get_session(
+        app_name="deltaapp", user_id="alice", session_id="ds-1"
+    )
+    assert fetched is not None
+    assert fetched.state.get("k") == "session-val"
+    assert fetched.state.get("app:tenant") == "acme"
+    assert fetched.state.get("user:lang") == "en"
+    assert "temp:secret" not in fetched.state
+
+
+async def test_partial_event_is_not_persisted(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Streaming partial events are in-flight LLM tokens; persisting them
+    would create a write storm and store intermediate junk. Verify they
+    bypass the storage path."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    s = await session_service.create_session(
+        app_name="partialapp", user_id="alice", session_id="p-1"
+    )
+    partial = Event(
+        invocation_id="inv",
+        author="model",
+        partial=True,
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text="streaming...")]
+        ),
+        actions=EventActions(),
+    )
+    await session_service.append_event(s, partial)
+
+    fetched = await session_service.get_session(
+        app_name="partialapp", user_id="alice", session_id="p-1"
+    )
+    assert fetched is not None
+    assert fetched.events == []
+
+
+async def test_list_sessions_isolated_per_app(
+    session_service: AerospikeSessionService,
+) -> None:
+    """``list_sessions(app_name=X, user_id=Y)`` must not surface Y's sessions
+    from a different app — sec-index returns by user; the app filter is
+    applied in Python."""
+    await session_service.create_session(
+        app_name="appA", user_id="shared-user", session_id="ai-A"
+    )
+    await session_service.create_session(
+        app_name="appB", user_id="shared-user", session_id="ai-B"
+    )
+
+    only_a = await session_service.list_sessions(
+        app_name="appA", user_id="shared-user"
+    )
+    ids = {s.id for s in only_a.sessions}
+    assert "ai-A" in ids
+    assert "ai-B" not in ids
+
+
+async def test_list_sessions_does_not_return_chunk_records(
+    aerospike_uri: str,
+) -> None:
+    """Chunks omit the app/uid/sid bins so they're invisible to the sec-index.
+    Force chunk creation and verify list_sessions still returns one row."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService(
+        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
+        namespace="test",
+        flush_threshold_bytes=200,
+        huge_event_bytes=10_000,
+    )
+    try:
+        s = await svc.create_session(
+            app_name="chunklist", user_id="u", session_id="cl-1"
+        )
+        for i in range(10):
+            await svc.append_event(
+                s,
+                Event(
+                    invocation_id=f"i{i}",
+                    author="user",
+                    content=genai_types.Content(
+                        role="user", parts=[genai_types.Part(text=f"e-{i}")]
+                    ),
+                    actions=EventActions(),
+                ),
+            )
+
+        resp = await svc.list_sessions(app_name="chunklist", user_id="u")
+        matching = [x for x in resp.sessions if x.id == "cl-1"]
+        assert len(matching) == 1, (
+            f"Expected exactly one session record for cl-1, got {len(matching)} — "
+            "chunks may be leaking into the sec-index"
+        )
+    finally:
+        svc.close()
+
+
+async def test_huge_event_pre_flush_isolates_event_in_own_chunk(
+    aerospike_uri: str,
+) -> None:
+    """An event whose estimated size exceeds ``huge_event_bytes`` triggers a
+    pre-flush so the existing tail seals first; the huge event then lands in
+    a fresh tail by itself. Verify history reconstructs in order."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService(
+        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
+        namespace="test",
+        flush_threshold_bytes=10_000,
+        huge_event_bytes=500,
+    )
+    try:
+        s = await svc.create_session(
+            app_name="hugeapp", user_id="u", session_id="he-1"
+        )
+        # Small events first — they live in the tail.
+        for i in range(3):
+            await svc.append_event(
+                s,
+                Event(
+                    invocation_id=f"sm{i}",
+                    author="user",
+                    content=genai_types.Content(
+                        role="user", parts=[genai_types.Part(text=f"small-{i}")]
+                    ),
+                    actions=EventActions(),
+                ),
+            )
+        # A "huge" event whose estimated size exceeds huge_event_bytes=500.
+        # ~600 byte payload comfortably trips the threshold via str() overhead.
+        big_text = "x" * 600
+        await svc.append_event(
+            s,
+            Event(
+                invocation_id="huge",
+                author="user",
+                content=genai_types.Content(
+                    role="user", parts=[genai_types.Part(text=big_text)]
+                ),
+                actions=EventActions(),
+            ),
+        )
+        await svc.append_event(
+            s,
+            Event(
+                invocation_id="after",
+                author="user",
+                content=genai_types.Content(
+                    role="user", parts=[genai_types.Part(text="after")]
+                ),
+                actions=EventActions(),
+            ),
+        )
+
+        fetched = await svc.get_session(
+            app_name="hugeapp", user_id="u", session_id="he-1"
+        )
+        assert fetched is not None
+        texts = [e.content.parts[0].text for e in fetched.events]
+        assert texts == ["small-0", "small-1", "small-2", big_text, "after"]
+    finally:
+        svc.close()
+
+
+async def test_after_timestamp_filter_prunes_old_events(
+    aerospike_uri: str,
+) -> None:
+    """``GetSessionConfig.after_timestamp`` drops events older than the cutoff.
+    With chunking on, this exercises the ``ts_hi`` chunk-pruning fast path."""
+    import time
+
+    from google.adk.events import Event, EventActions
+    from google.adk.sessions.base_session_service import GetSessionConfig
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService(
+        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
+        namespace="test",
+        flush_threshold_bytes=200,
+        huge_event_bytes=10_000,
+    )
+    try:
+        s = await svc.create_session(
+            app_name="tsapp", user_id="u", session_id="ts-1"
+        )
+        # Three old events with explicit small timestamps → flushed into a chunk.
+        for i in range(4):
+            await svc.append_event(
+                s,
+                Event(
+                    invocation_id=f"old{i}",
+                    author="user",
+                    timestamp=100.0 + i,  # well in the past
+                    content=genai_types.Content(
+                        role="user", parts=[genai_types.Part(text=f"old-{i}")]
+                    ),
+                    actions=EventActions(),
+                ),
+            )
+
+        cutoff = time.time() + 100  # future-ish cutoff first, then events past it
+
+        # Two "new" events with timestamps after the cutoff.
+        for i in range(2):
+            await svc.append_event(
+                s,
+                Event(
+                    invocation_id=f"new{i}",
+                    author="user",
+                    timestamp=cutoff + 1 + i,
+                    content=genai_types.Content(
+                        role="user", parts=[genai_types.Part(text=f"new-{i}")]
+                    ),
+                    actions=EventActions(),
+                ),
+            )
+
+        fetched = await svc.get_session(
+            app_name="tsapp",
+            user_id="u",
+            session_id="ts-1",
+            config=GetSessionConfig(after_timestamp=cutoff),
+        )
+        assert fetched is not None
+        texts = [e.content.parts[0].text for e in fetched.events]
+        # Only the post-cutoff events survive; chunk pruning by ts_hi means
+        # we shouldn't materialise the old chunk at all.
+        assert texts == ["new-0", "new-1"]
+    finally:
+        svc.close()
+
+
+async def test_num_recent_events_zero_returns_empty(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Edge case: explicit ``num_recent_events=0`` short-circuits — we should
+    not read any chunks or the tail."""
+    from google.adk.events import Event, EventActions
+    from google.adk.sessions.base_session_service import GetSessionConfig
+    from google.genai import types as genai_types
+
+    s = await session_service.create_session(
+        app_name="zeroapp", user_id="u", session_id="z-1"
+    )
+    await session_service.append_event(
+        s,
+        Event(
+            invocation_id="i",
+            author="user",
+            content=genai_types.Content(
+                role="user", parts=[genai_types.Part(text="hello")]
+            ),
+            actions=EventActions(),
+        ),
+    )
+    fetched = await session_service.get_session(
+        app_name="zeroapp",
+        user_id="u",
+        session_id="z-1",
+        config=GetSessionConfig(num_recent_events=0),
+    )
+    assert fetched is not None
+    assert fetched.events == []
+
+
+async def test_delete_missing_session_is_noop(
+    session_service: AerospikeSessionService,
+) -> None:
+    """``delete_session`` on an unknown id must not raise."""
+    await session_service.delete_session(
+        app_name="ghostapp", user_id="ghost", session_id="never-existed"
+    )
+
+
+async def test_get_session_with_unrelated_user_returns_none(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Session keys include user_id — a different user can't read alice's
+    session even if they guess the id."""
+    s = await session_service.create_session(
+        app_name="isoapp", user_id="alice", session_id="iso-1"
+    )
+    out = await session_service.get_session(
+        app_name="isoapp", user_id="mallory", session_id=s.id
+    )
+    assert out is None
+
+
+async def test_append_event_updates_last_update_time(
+    session_service: AerospikeSessionService,
+) -> None:
+    """The session's ``last_update_time`` must reflect the latest event ts."""
+    import time
+
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    s = await session_service.create_session(
+        app_name="utapp", user_id="alice", session_id="ut-1"
+    )
+    created_ts = s.last_update_time
+    time.sleep(0.01)
+    await session_service.append_event(
+        s,
+        Event(
+            invocation_id="i",
+            author="user",
+            content=genai_types.Content(
+                role="user", parts=[genai_types.Part(text="hi")]
+            ),
+            actions=EventActions(),
+        ),
+    )
+    fetched = await session_service.get_session(
+        app_name="utapp", user_id="alice", session_id="ut-1"
+    )
+    assert fetched is not None
+    assert fetched.last_update_time > created_ts

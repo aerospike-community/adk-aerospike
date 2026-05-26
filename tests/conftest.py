@@ -76,9 +76,10 @@ network {{
 namespace test {{
     replication-factor 1
     storage-engine memory {{
-        data-size 1G
+        data-size 4G
     }}
     nsup-period 60
+    stop-writes-sys-memory-pct 95
 }}
 """
 
