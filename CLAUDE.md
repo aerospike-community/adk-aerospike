@@ -4,13 +4,13 @@ Context for Claude Code working in this repository. Auto-loaded on session start
 
 ## What this project is
 
-A Python package that implements [Google ADK](https://adk.dev/)'s three pluggable storage interfaces — `BaseSessionService`, `BaseArtifactService`, `BaseMemoryService` — on top of **Aerospike Database** + **Aerospike Vector Search (AVS)**.
+A Python package that implements [Google ADK](https://adk.dev/)'s three pluggable storage interfaces — `BaseSessionService`, `BaseArtifactService`, `BaseMemoryService` — on top of **Aerospike Database**.
 
 Target: PyPI release as `adk-aerospike`, eventual listing in `google/adk-docs`, parallel adk-java `contrib/` PR. Status: **alpha; all three services (Session, Artifact, Memory) implemented end-to-end against ADK 2.x and tested.**
 
 ## Who the user is
 
-`ggeorges@aerospike.com` — Aerospike engineer. Assume strong Aerospike fluency: CDTs, secondary indexes, AVS, strong consistency, MRTs (multi-record transactions). Less assumption about ADK internals. **Frame ADK details in terms of Aerospike primitives**, not the other way around.
+`ggeorges@aerospike.com` — Aerospike engineer. Assume strong Aerospike fluency: CDTs, secondary indexes (including list-element indexes), strong consistency, MRTs (multi-record transactions). Less assumption about ADK internals. **Frame ADK details in terms of Aerospike primitives**, not the other way around.
 
 User style preferences observed in prior sessions:
 - Terse responses. End-of-turn one or two sentences.
@@ -35,7 +35,7 @@ The third-party ADK storage integration landscape (as of 2026-05) is thin and un
 Our differentiators:
 1. Triple coverage in one package.
 2. **URI scheme registration** via `service_registry` — `adk web --session_db_url=aerospike://…` works (no competitor does this).
-3. **Memory in core Aerospike** — embeddings stored as `list[float]` bins, brute-force cosine after metadata pre-filter. No AVS dependency (AVS is deprecated). No HTTP sidecar.
+3. **Lexical memory in core Aerospike** — text tokenized at write time into a `keywords` list bin; queries use the list-element secondary index (`predicates.contains` + `INDEX_TYPE_LIST`) for server-side word-overlap search. Same semantics as ADK's `InMemoryMemoryService`, executed in the database. No embedder, no HTTP sidecar.
 4. Mirror in adk-java contrib/ later.
 
 ## Current status
@@ -84,11 +84,10 @@ src/adk_aerospike/
 ├── artifacts/{__init__,service}.py
 └── memory/
     ├── __init__.py
-    ├── embedder.py      # PUBLIC: Embedder Protocol (user implements)
-    └── service.py       # Core Aerospike — no AVS dependency
+    └── service.py       # Lexical word-overlap via list-element sec-index
 ```
 
-Underscore conventions: `_internal/` = private subpackage, may change without major version bump. `registry.py` has no underscore because `register()` is real public surface. `embedder.py` is separated from `memory/service.py` because `Embedder` is a public Protocol users implement.
+Underscore conventions: `_internal/` = private subpackage, may change without major version bump. `registry.py` has no underscore because `register()` is real public surface.
 
 ## Connection best practices (codified in `_internal/client.py`)
 
@@ -184,7 +183,7 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 - ORM ordering by `timestamp` → explicit `seq:08d` zero-padded suffix (lexicographically sortable, secondary-indexable)
 - Row-update on state delta → single-RTT atomic `map_put_items` Map CDT
 - `_storage_update_marker` revision check → server-side atomic `operate(increment(seq) + read(seq))`
-- JSON-blob vector storage → native `list[float]` bin (preserves ANN ability)
+- Client-side text matching → tokenized `keywords` list bin + list-element sec-index for server-side `predicates.contains` queries
 
 ### Verify this hierarchy is current
 
@@ -295,7 +294,7 @@ The venv at `.venv/` already has everything installed (`pip install -e ".[dev]"`
 - **Not a fork of ADK** — we depend on `google-adk`.
 - **Not an MCP tool.** Pinecone/Couchbase/Qdrant/Mongo ship MCP tools; those are LLM-callable, not framework-invoked. We build real `BaseMemoryService`.
 - **No HTTP sidecar.** Rejected the `adk-redis` pattern.
-- **No AVS dependency.** AVS is deprecated; we use core Aerospike for vectors.
+- **No vector search.** Aerospike does not have native vector search; we use core KV + list-element secondary indexes for lexical memory.
 - **Not on PyPI yet.** Local editable install only.
 - **Java port not started in this repo** — separate scaffold at `~/IdeaProjects/GoogleADK`.
 

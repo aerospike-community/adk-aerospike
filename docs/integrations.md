@@ -1,24 +1,26 @@
 ---
 catalog_title: Aerospike
-catalog_description: Aerospike-backed Session, Memory, and Artifact services — low-latency KV, native vector search, no sidecar.
+catalog_description: Aerospike-backed Session, Memory, and Artifact services — sub-millisecond KV, single in-process backend, no sidecar.
 catalog_icon: aerospike.png
 ---
 
 # Aerospike
 
-[Aerospike](https://aerospike.com/) is a distributed, real-time NoSQL database
-with native vector search. The `adk-aerospike` package provides full
-implementations of all three ADK storage interfaces.
+[Aerospike](https://aerospike.com/) is a distributed, real-time NoSQL database.
+The `adk-aerospike` package provides full implementations of all three ADK
+storage interfaces on top of a single Aerospike cluster.
 
 ## Use cases
 
 - **Low-latency agent state**: sub-millisecond reads/writes for sessions in
   high-throughput agents (chatbots, voice, real-time tool orchestration).
-- **Persistent semantic memory**: embeddings stored as `list[float]` bins in
-  core Aerospike; brute-force cosine similarity after a metadata pre-filter on
-  `app_name` and `user_id`.
+- **Server-side lexical memory**: text is tokenized at write time and stored
+  as a `keywords` list bin. Search runs server-side via Aerospike's
+  list-element secondary index — same word-overlap semantics as ADK's
+  built-in `InMemoryMemoryService`, executed in the database rather than the
+  client.
 - **One database for the whole agent layer**: sessions, artifacts, and memory
-  share a single cluster — no Redis-for-sessions + Pinecone-for-memory split.
+  share a single cluster.
 
 ## Prerequisites
 
@@ -70,9 +72,9 @@ adk web --session_db_url=aerospike://localhost:3000/adk
 
 | Service                        | ADK interface          | Notes                                      |
 | ------------------------------ | ---------------------- | ------------------------------------------ |
-| `AerospikeSessionService`      | `BaseSessionService`   | Session + event + scoped state             |
+| `AerospikeSessionService`      | `BaseSessionService`   | Session + event + scoped state, chunked at 256 KiB |
 | `AerospikeArtifactService`     | `BaseArtifactService`  | Versioned blobs, ≤8 MiB inline             |
-| `AerospikeMemoryService`       | `BaseMemoryService`    | Embeddings stored in core Aerospike; brute-force cosine |
+| `AerospikeMemoryService`       | `BaseMemoryService`    | Lexical word-overlap via list-element secondary index |
 
 ## Resources
 

@@ -21,12 +21,6 @@ def test_default_port():
     assert u.hosts == (("host", 3000),)
 
 
-def test_avs_default_port():
-    u = parse("aerospike+avs://host/ns")
-    assert u.hosts == (("host", 5000),)
-    assert u.scheme == "aerospike+avs"
-
-
 def test_multi_host():
     u = parse("aerospike://a:3000,b:3000,c:3001/ns")
     assert u.hosts == (("a", 3000), ("b", 3000), ("c", 3001))

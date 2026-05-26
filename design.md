@@ -37,9 +37,10 @@ analysis in §11). The market gaps we fill:
    matching.
 2. **No HTTP sidecar.** Native in-process client. Operationally simpler than
    `adk-redis` (which requires an Agent Memory Server on `:8088`).
-3. **No AVS dependency.** Vectors stored as `list[float]` bins directly in
-   core Aerospike. AVS (Aerospike Vector Search) is deprecated; we should not
-   build new products against it.
+3. **No vector search dependency.** Memory uses lexical word-overlap
+   (same semantics as ADK's reference `InMemoryMemoryService`), executed
+   server-side via Aerospike's list-element secondary index. No embeddings,
+   no embedder, no AI/ML surface area.
 4. **URI-scheme registration** with ADK's `service_registry` — `adk web`
    flags work out of the box. No competitor in the community ecosystem does
    this.
@@ -641,13 +642,6 @@ Memory Bank — on top of (or alongside) `adk-aerospike`. We chose not to
 fake it with a thin embedder hook that would obscure the real
 architectural decision.
 
-### What we removed
-
-Earlier scaffolding included an `Embedder` Protocol, an `embed` `list[float]`
-bin per memory record, and a brute-force cosine loop in Python. All of it
-was deleted when we adopted the lexical design — fewer dependencies, fewer
-bytes per record, and a more honest story about what the service does.
-
 ---
 
 ## 8. Artifact service — design decisions
@@ -846,7 +840,7 @@ listing submission.
 
 | Integration | Maintainer | Sess | Art | Mem | Architecture | URI scheme | Vector / embedder |
 |---|---|:-:|:-:|:-:|---|---|---|
-| **adk-aerospike** (us) | Aerospike | ✓ | ✓ | ✓ semantic | In-process, single backend, no sidecar | `aerospike://` registered | User-supplied `Embedder` callable, brute-force cosine over `list[float]` |
+| **adk-aerospike** (us) | Aerospike | ✓ | ✓ | ✓ lexical | In-process, single backend, no sidecar | `aerospike://` registered | No embedder — lexical word-overlap via list-element secondary index |
 | adk-redis | Redis Inc. | ✓ | ✗ | ✓ | HTTP sidecar (Agent Memory Server :8088) + RedisVL | Import-only | Sidecar embeds; not user-injectable |
 | adk-python built-in | Google | ✓ (InMemory, SQLAlchemy, Vertex) | ✓ (InMemory, GCS) | ✓ (InMemory, Vertex MemoryBank, Vertex RAG) | In-process / managed cloud | `sqlite://`, `postgresql://`, `mysql://`, `agentengine://`, `gs://` | Vertex hides embedder |
 | adk-extra-services | Community | ✓ Mongo, Redis | ✓ S3, Local, Azure | ✗ | In-process | Import-only | N/A |
@@ -883,7 +877,8 @@ Document these for users; pick which ones to close before 1.0.
 
 | Limit | Severity | Mitigation / future work |
 |---|---|---|
-| Memory search is O(N) per (app, user) | Medium | Numpy-vectorize; cache per-user matrix; or external ANN |
+| Memory search ranking is naïve (token-overlap count, no TF-IDF/BM25) | Low | Ranking happens client-side; can be enhanced without schema change. For true full-text needs, use Aerospike's Elasticsearch connector. |
+| Aerospike list-element index has ~1024 elements/record cap | Low | Tokenizer dedupes; typical chat turn well under cap. Cap configurable in namespace config. |
 | Session record ≤ ~280 KiB (post-chunking) | Low | By design; rejects state Maps > ~50 KiB |
 | Artifact inline ≤ namespace `write-block-size` | Medium | Plan hybrid: large artifacts to S3/GCS with reference here |
 | Reserved session-id `"user"` (collides with user-scoped artifact slot) | Low | Inherit ADK upstream's same constraint; document |

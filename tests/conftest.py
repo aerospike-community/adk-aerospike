@@ -88,10 +88,6 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "aerospike: requires a running Aerospike server (testcontainers will provide one)",
     )
-    config.addinivalue_line(
-        "markers",
-        "avs: requires a running Aerospike Vector Search instance",
-    )
 
 
 @pytest.fixture(scope="session")
