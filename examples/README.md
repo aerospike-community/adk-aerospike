@@ -35,15 +35,43 @@ SLACK_MCP_XOXP_TOKEN=dummy python examples/adk_samples_e2e.py
 # Both scripts accept --uri (any Aerospike cluster) and --samples-path.
 ```
 
+## Compat shims (built-in)
+
+Several official samples have import-time hooks that fail in a clean
+environment. The harnesses apply two narrowly-scoped shims so the samples
+can be evaluated against our services:
+
+1. **`google.auth.default` stubbed during sample import only.** Vertex-coupled
+   samples (memory-bank, customer-service, blog-writer) construct Vertex
+   clients at module load and call `google.auth.default()`, raising
+   `DefaultCredentialsError` on hosts without GCP Application Default
+   Credentials. We stub the call for the duration of `importlib.import_module(...)`
+   and restore the real function before any runtime LLM call so we don't
+   poison the auth path.
+2. **`google.adk.a2a.utils.agent_to_a2a.to_a2a` stubbed to a no-op.**
+   currency-agent pins `a2a-sdk==0.3.3` whose `a2a.server.apps` module path
+   moved in 1.0+. The unused `a2a_app` export still constructs.
+3. **`GOOGLE_GENAI_USE_VERTEXAI=false`** is set so the SDK uses the Gemini
+   Developer API (`GOOGLE_API_KEY` path) rather than auto-picking Vertex
+   when ADC happens to be discoverable.
+
+These shims only widen what's *importable*. They don't paper over runtime
+problems: a sample that genuinely needs Vertex at runtime would still
+need real ADC.
+
 ## Reference outcomes (alpha)
 
 Curated set of 7 samples covering `LlmAgent`, `SequentialAgent`,
-`ParallelAgent`, agents with tools, and multi-agent workflows:
+`ParallelAgent`, multi-agent workflows, and agents with tools, validated
+against the AWS Pegasus cluster:
 
-- **Wiring**: 6 / 7 pass. The one failure (`currency-agent`) pins old SDK
-  versions (`a2a-sdk==0.3.3`, `google-adk==1.13.0`) incompatible with what's
-  installed — a sample-side problem, not our integration.
-- **E2E**: 3 / 3 selected samples (`fun-facts`, `llm-auditor`,
-  `customer-service`) drive real Gemini turns; multi-agent sequential
-  events arrive in order; stateful tool callbacks populate `session.state`
-  correctly.
+- **Wiring**: **7 / 7 ✓** — all samples import, accept our service trio
+  via `Runner(...)`, and round-trip a synthetic event through
+  `create_session → append_event → get_session → add_session_to_memory →
+  search_memory`.
+- **E2E**: **7 / 7 ✓** — all 7 drive real Gemini turns through
+  `runner.run_async()`. Cluster state after one run:
+  `adk_sessions: 7, adk_memory: 21` (one session per sample, multiple
+  text-bearing events from multi-agent samples like `parallel_task`
+  which emits 17 events and `blog-writer` with `transfer_to_agent`
+  calls).

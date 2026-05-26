@@ -39,19 +39,30 @@ import aerospike
 from dotenv import load_dotenv
 
 
-def _apply_compat_shims() -> None:
-    """Make broken-or-Vertex-coupled samples importable.
+import google.auth as _ga
 
-    Same shims as ``adk_samples_wiring.py``. See that file's docstring for
-    rationale. Note: these only patch IMPORT-time hooks; runtime calls into
-    Vertex / A2A still need real credentials, so the E2E phase may fail for
-    samples that actually invoke Vertex at run time (e.g. memory-bank).
+_ORIG_GAUTH_DEFAULT = _ga.default
+
+
+def _shim_auth_on() -> None:
+    """Stub google.auth.default so Vertex-coupled samples can construct
+    their clients at module import time. Pair every call with _shim_auth_off()."""
+    _ga.default = lambda *a, **k: ((None, None), "dummy-project")
+
+
+def _shim_auth_off() -> None:
+    """Restore the real google.auth.default so runtime LLM calls aren't
+    fooled into thinking ADC exists when it doesn't."""
+    _ga.default = _ORIG_GAUTH_DEFAULT
+
+
+def _apply_static_shims() -> None:
+    """Install always-on compat shims that don't poison runtime auth.
+
+    Currently: stub ``google.adk.a2a.utils.agent_to_a2a.to_a2a`` so
+    currency-agent (which pins old ``a2a-sdk==0.3.3``) can import on newer
+    versions where ``a2a.server.apps`` no longer exists.
     """
-    try:
-        import google.auth
-        google.auth.default = lambda *a, **k: ((None, None), "dummy-project")
-    except Exception:
-        pass
     if "google.adk.a2a.utils.agent_to_a2a" not in sys.modules:
         fake = types.ModuleType("google.adk.a2a.utils.agent_to_a2a")
         fake.to_a2a = lambda *a, **k: None  # type: ignore[attr-defined]
@@ -59,6 +70,9 @@ def _apply_compat_shims() -> None:
         sys.modules.setdefault("google.adk.a2a.utils",
                                types.ModuleType("google.adk.a2a.utils"))
         sys.modules["google.adk.a2a.utils.agent_to_a2a"] = fake
+    # Force google-genai SDK to use the Developer-API code path (GOOGLE_API_KEY)
+    # rather than auto-picking Vertex when ADC happens to be discoverable.
+    os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "false")
 
 
 # Default to ../adk-samples relative to the adk-aerospike repo root.
@@ -103,7 +117,11 @@ async def run_one(label: str, parent: str, pkg: str, user_msg: str, uri: str) ->
         if k == pkg or k.startswith(pkg + "."):
             sys.modules.pop(k, None)
 
-    mod = importlib.import_module(f"{pkg}.agent")
+    _shim_auth_on()
+    try:
+        mod = importlib.import_module(f"{pkg}.agent")
+    finally:
+        _shim_auth_off()
     agent = getattr(mod, "root_agent", None)
     if agent is None:
         print(f"  SKIP: {pkg}.agent has no root_agent")
@@ -213,7 +231,7 @@ async def main(args: argparse.Namespace) -> None:
               f"Add it to {_REPO_ROOT/'.env'} or your shell environment.")
         sys.exit(1)
 
-    _apply_compat_shims()
+    _apply_static_shims()
 
     samples_root = Path(args.samples_path).resolve()
     if not (samples_root / "python" / "agents").exists():

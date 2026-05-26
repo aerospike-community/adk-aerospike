@@ -365,7 +365,7 @@ Current state: **39 passed, 0 skipped, 0 failed.**
 - [`design.md`](design.md) — full design document (for engineering / DevRel)
 - [`docs/data-model.md`](docs/data-model.md) — set/bin/index reference
 - [`docs/integrations.md`](docs/integrations.md) — ADK integration catalog entry
-- [`examples/`](examples/) — runnable examples, including end-to-end validation against Google's official [`adk-samples`](https://github.com/google/adk-samples) (see [`examples/README.md`](examples/README.md))
+- [`examples/`](examples/) — runnable examples, including end-to-end validation against Google's official [`adk-samples`](https://github.com/google/adk-samples) (7/7 wiring + 7/7 real-Gemini E2E — see [`examples/README.md`](examples/README.md))
 - [`CLAUDE.md`](CLAUDE.md) — auto-loaded context for Claude Code sessions
 
 ## Comparison with other ADK storage integrations

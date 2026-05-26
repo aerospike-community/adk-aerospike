@@ -64,25 +64,29 @@ import types
 from pathlib import Path
 
 
-def _apply_compat_shims() -> None:
-    """Make broken-or-Vertex-coupled samples importable for the wiring smoke test.
+import google.auth as _ga
+_ORIG_GAUTH_DEFAULT = _ga.default
 
-    Only patches at IMPORT time — runtime calls into Vertex / A2A would still
-    need real credentials. We don't make those calls in this smoke test.
+
+def _shim_auth_on() -> None:
+    """Stub google.auth.default so Vertex-coupled samples can construct
+    their clients at module import time. Pair with _shim_auth_off()."""
+    _ga.default = lambda *a, **k: ((None, None), "dummy-project")
+
+
+def _shim_auth_off() -> None:
+    """Restore real google.auth.default — runtime LLM calls must not be
+    fooled into thinking ADC exists when it doesn't."""
+    _ga.default = _ORIG_GAUTH_DEFAULT
+
+
+def _apply_static_shims() -> None:
+    """Install always-on compat shims that don't affect runtime auth.
+
+    Currently: stub ``google.adk.a2a.utils.agent_to_a2a.to_a2a`` so
+    currency-agent (which pins old ``a2a-sdk==0.3.3``) can import on newer
+    versions where ``a2a.server.apps`` no longer exists.
     """
-    # Vertex-coupled samples (memory-bank, customer-service, blog-writer)
-    # call google.auth.default() during their Vertex client construction at
-    # module import time. Stub it.
-    try:
-        import google.auth
-        google.auth.default = lambda *a, **k: ((None, None), "dummy-project")
-    except Exception:
-        pass
-
-    # currency-agent imports google.adk.a2a.utils.agent_to_a2a.to_a2a, which
-    # in turn imports a2a.server.apps — a module path that exists in
-    # a2a-sdk 0.3.x but moved in 1.0+. Stub the public symbol so the sample
-    # can construct its (unused for our purposes) a2a_app variable.
     if "google.adk.a2a.utils.agent_to_a2a" not in sys.modules:
         fake = types.ModuleType("google.adk.a2a.utils.agent_to_a2a")
         fake.to_a2a = lambda *a, **k: None  # type: ignore[attr-defined]
@@ -90,6 +94,7 @@ def _apply_compat_shims() -> None:
         sys.modules.setdefault("google.adk.a2a.utils",
                                types.ModuleType("google.adk.a2a.utils"))
         sys.modules["google.adk.a2a.utils.agent_to_a2a"] = fake
+    os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "false")
 
 # Default path: ../adk-samples relative to this script's repo root.
 _DEFAULT_SAMPLES = str(Path(__file__).resolve().parent.parent.parent / "adk-samples")
@@ -142,12 +147,15 @@ async def smoke_one(label: str, parent: str, pkg: str, uri: str) -> dict:
         if k == pkg or k.startswith(pkg + "."):
             sys.modules.pop(k, None)
 
+    _shim_auth_on()
     try:
         mod = importlib.import_module(f"{pkg}.agent")
         r["import"] = "✓"
     except Exception as e:
         r["errors"].append(f"import: {type(e).__name__}: {e}")
         return r
+    finally:
+        _shim_auth_off()
 
     agent = getattr(mod, "root_agent", None)
     if agent is None:
@@ -222,7 +230,7 @@ async def main(args: argparse.Namespace) -> None:
               f"Clone the samples repo there or pass --samples-path.")
         sys.exit(2)
 
-    _apply_compat_shims()
+    _apply_static_shims()
 
     samples = discover_samples(samples_root)
     print(f"adk-aerospike × adk-samples wiring smoke test")
