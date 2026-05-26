@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 
+import os
+
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.genai import types
@@ -23,13 +25,14 @@ from adk_aerospike import AerospikeSessionService
 
 
 async def main() -> None:
+
     session_service = AerospikeSessionService.from_uri(
         "aerospike://localhost:3000/test"
     )
 
     agent = LlmAgent(
         name="greeter",
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         instruction="You are a friendly assistant. Keep replies under 30 words.",
     )
 
