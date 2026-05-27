@@ -41,28 +41,26 @@ registration so the `adk` CLI can use Aerospike directly:
 - **No AI/ML dependency.** Memory is a storage backend, not an embedding
   pipeline — no embedder to wire up, no model to host.
 
-## Current Install
-
-**Ensure your python version is 11 before proceeding.**
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -e .
-
-# To test:
-python -c "from adk_aerospike import AerospikeSessionService; print('ok')"
-# Should print ok below.
-```
-
-Requires Python 3.11+ and Aerospike Database 7.x or 8.x (Community or Enterprise).
-
-## Future Install
+## Install
 
 ```bash
 pip install adk-aerospike
 ```
 
 Requires Python 3.11+ and Aerospike Database 7.x or 8.x (Community or Enterprise).
+
+### Development install
+
+From a clone of this repository (Python 3.11+):
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+python -c "from adk_aerospike import AerospikeSessionService; print('ok')"
+```
+
+Release process: [RELEASING.md](RELEASING.md).
 
 ## Quick start
 
