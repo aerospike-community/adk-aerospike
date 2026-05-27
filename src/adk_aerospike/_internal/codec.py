@@ -19,25 +19,12 @@ Design notes
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
+
+from .schema import EVENT_SCHEMA_VERSION, EventFieldName
 
 if TYPE_CHECKING:
     from google.adk.events import Event
-
-
-EVENT_SCHEMA_VERSION: Final = 1
-"""On-record version tag for the event Map shape.
-
-Bumped only when the field set changes in a way the reader needs to
-disambiguate (rename, retype, semantic shift). Adding a new optional field is
-**not** a version bump — `event_from_inline_dict` ignores unknown keys and
-Pydantic fills in defaults for missing ones.
-
-Persisted as the ``_v`` key inside each event Map. Pre-1.0 records written
-before this tag was introduced are treated as version 0 and read with the
-same rules as version 1 (the shape was identical; the tag is just newly
-explicit).
-"""
 
 
 def event_to_inline_dict(event: Event) -> dict[str, Any]:
@@ -52,13 +39,13 @@ def event_to_inline_dict(event: Event) -> dict[str, Any]:
     """
     dump = event.model_dump(mode="json")
     return {
-        "_v": EVENT_SCHEMA_VERSION,
-        "eid": dump.get("id"),
-        "ts": dump.get("timestamp", 0.0),
-        "author": dump.get("author"),
-        "content": dump.get("content"),
-        "actions": dump.get("actions"),
-        "branch": dump.get("branch"),
+        EventFieldName.SCHEMA_VERSION: EVENT_SCHEMA_VERSION,
+        EventFieldName.EVENT_ID: dump.get("id"),
+        EventFieldName.TIMESTAMP: dump.get("timestamp", 0.0),
+        EventFieldName.AUTHOR: dump.get("author"),
+        EventFieldName.CONTENT: dump.get("content"),
+        EventFieldName.ACTIONS: dump.get("actions"),
+        EventFieldName.BRANCH: dump.get("branch"),
     }
 
 
@@ -69,12 +56,12 @@ def event_from_inline_dict(d: dict[str, Any]) -> Event:
     # the same field set, so no branching needed today.
     return Event.model_validate(
         {
-            "id": d.get("eid") or "",
-            "timestamp": d.get("ts", 0.0),
-            "author": d.get("author"),
-            "content": d.get("content"),
-            "actions": d.get("actions"),
-            "branch": d.get("branch"),
+            "id": d.get(EventFieldName.EVENT_ID) or "",
+            "timestamp": d.get(EventFieldName.TIMESTAMP, 0.0),
+            "author": d.get(EventFieldName.AUTHOR),
+            "content": d.get(EventFieldName.CONTENT),
+            "actions": d.get(EventFieldName.ACTIONS),
+            "branch": d.get(EventFieldName.BRANCH),
         }
     )
 

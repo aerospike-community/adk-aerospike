@@ -1,8 +1,10 @@
 # adk-aerospike
 
+[![Tests](https://github.com/ggeorges-aerospike/adk-aerospike/actions/workflows/tests.yml/badge.svg)](https://github.com/ggeorges-aerospike/adk-aerospike/actions/workflows/tests.yml)
+
 Aerospike-backed storage services for [Google Agent Development Kit (ADK)](https://adk.dev/).
 
-**Status:** alpha (0.0.1). All three ADK storage interfaces implemented end-to-end against ADK 2.x. 39 tests passing.
+**Status:** alpha (0.0.1). All three ADK storage interfaces implemented end-to-end against ADK 2.x.
 
 ## What's in here
 
@@ -361,7 +363,16 @@ see [`design.md`](design.md).
 
 ## Running tests
 
-The integration tests spin up an Aerospike container via `testcontainers`:
+CI runs on every push to `main` and on pull requests (see
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml)):
+
+- **Unit** — `pytest -m "not aerospike"` on Python 3.11 and 3.12 (no Docker).
+- **Integration** — starts **Aerospike CE** with
+  [`scripts/start_aerospike_ce.sh`](scripts/start_aerospike_ce.sh)
+  (`docker run aerospike/aerospike-server:latest`), then `pytest -m aerospike`
+  (~4 minutes).
+
+Locally:
 
 ```bash
 pip install -e ".[dev]"
@@ -369,11 +380,18 @@ pip install -e ".[dev]"
 # Unit tests only (no Docker required, ~2s)
 pytest -m "not aerospike"
 
-# Full suite (~2 minutes, requires Docker)
+# Integration — explicit Aerospike CE container (matches CI)
+./scripts/start_aerospike_ce.sh
+set -a && source .aerospike-ci.env && set +a
+pytest -m aerospike
+./scripts/stop_aerospike_ce.sh
+
+# Integration — or let testcontainers start Aerospike for you (no script)
+pytest -m aerospike
+
+# Full suite (testcontainers path if env vars unset)
 pytest
 ```
-
-Current state: **39 passed, 0 skipped, 0 failed.**
 
 ## Documentation
 

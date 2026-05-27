@@ -17,6 +17,11 @@ from adk_aerospike._internal.codec import (
     event_to_inline_dict,
     extract_event_text,
 )
+from adk_aerospike._internal.schema import (
+    EVENT_SCHEMA_VERSION,
+    BinName,
+    EventFieldName,
+)
 from adk_aerospike._internal.keys import (
     USER_SCOPE_SID,
     artifact_key,
@@ -105,16 +110,12 @@ def test_event_inline_dict_shape_is_stable():
     need a migration story (and a bump to EVENT_SCHEMA_VERSION)."""
     ev = _make_event()
     d = event_to_inline_dict(ev)
-    assert set(d.keys()) == {
-        "_v", "eid", "ts", "author", "content", "actions", "branch",
-    }
+    assert set(d.keys()) == {f.value for f in EventFieldName}
 
 
 def test_event_schema_version_is_tagged():
-    from adk_aerospike._internal.codec import EVENT_SCHEMA_VERSION
-
     d = event_to_inline_dict(_make_event())
-    assert d["_v"] == EVENT_SCHEMA_VERSION
+    assert d[EventFieldName.SCHEMA_VERSION] == EVENT_SCHEMA_VERSION
 
 
 def test_event_from_inline_dict_tolerates_missing_version():

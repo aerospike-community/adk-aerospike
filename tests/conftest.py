@@ -4,26 +4,28 @@ The Aerospike-backed tests are gated behind the ``aerospike`` marker so unit
 tests on foundation modules (URI parsing, key construction) can run without
 a running server.
 
-To run integration tests::
+Integration tests need Aerospike Community Edition:
 
-    pip install -e ".[dev]"
-    pytest -m aerospike
-
-A throwaway Aerospike Community Edition container is started via
-``testcontainers`` and reused across the test session.
+- **CI / explicit setup:** ``scripts/start_aerospike_ce.sh`` starts
+  ``aerospike/aerospike-server:latest`` in Docker and writes
+  ``.aerospike-ci.env``. Set ``AEROSPIKE_TEST_HOST`` / ``AEROSPIKE_TEST_PORT``
+  (or source that file) before ``pytest``.
+- **Local default:** if those variables are unset, ``testcontainers`` starts
+  the same image with the same config template (``tests/aerospike_ce.conf.template``).
 
 Networking note
 ---------------
 Aerospike's cluster tend protocol reports the server's ``access-address`` /
 ``access-port`` to clients, who then reconnect using those values. In a
 Docker setup, the container's internal IP is not reachable from the host, so
-we mount a custom ``aerospike.conf`` that pins ``access-address`` to
-``127.0.0.1`` and ``access-port`` to the host-side port we bound. This is the
-canonical workaround for Aerospike-in-Docker on macOS / WSL.
+we mount a custom config that pins ``access-address`` to ``127.0.0.1`` and
+``access-port`` to the host-side port we bound. This is the canonical
+workaround for Aerospike-in-Docker on macOS / WSL / GitHub Actions.
 """
 
 from __future__ import annotations
 
+import os
 import socket
 import tempfile
 import time
@@ -31,6 +33,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+_CONF_TEMPLATE = Path(__file__).with_name("aerospike_ce.conf.template")
 
 
 def _find_free_port() -> int:
@@ -40,60 +44,41 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-_AEROSPIKE_CONF_TEMPLATE = """\
-service {{
-    proto-fd-max 15000
-    cluster-name adk-test
-}}
+def _render_aerospike_conf(access_port: int) -> str:
+    return _CONF_TEMPLATE.read_text().replace("__ACCESS_PORT__", str(access_port))
 
-logging {{
-    console {{
-        context any info
-    }}
-}}
 
-network {{
-    service {{
-        address any
-        port 3000
-        access-address 127.0.0.1
-        access-port {access_port}
-    }}
-    heartbeat {{
-        mode mesh
-        port 3002
-        interval 150
-        timeout 10
-    }}
-    fabric {{
-        port 3001
-    }}
-    info {{
-        port 3003
-    }}
-}}
-
-namespace test {{
-    replication-factor 1
-    storage-engine memory {{
-        data-size 4G
-    }}
-    nsup-period 60
-    stop-writes-sys-memory-pct 95
-}}
-"""
+def _connection_from_env() -> dict[str, object] | None:
+    host = os.environ.get("AEROSPIKE_TEST_HOST")
+    port_s = os.environ.get("AEROSPIKE_TEST_PORT")
+    if not host or not port_s:
+        return None
+    return {
+        "host": host,
+        "port": int(port_s),
+        "namespace": os.environ.get("AEROSPIKE_TEST_NAMESPACE", "test"),
+    }
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "aerospike: requires a running Aerospike server (testcontainers will provide one)",
+        "aerospike: requires Aerospike CE (env vars or testcontainers)",
     )
 
 
 @pytest.fixture(scope="session")
 def aerospike_container() -> Iterator[dict[str, object]]:
-    """Start an Aerospike CE container for the test session."""
+    """Aerospike CE connection settings for the test session.
+
+    Uses ``AEROSPIKE_TEST_*`` when set (CI runs ``scripts/start_aerospike_ce.sh``
+    first). Otherwise starts a throwaway container via testcontainers.
+    """
+    external = _connection_from_env()
+    if external is not None:
+        yield external
+        return
+
     pytest.importorskip("testcontainers")
     pytest.importorskip("aerospike")
     from testcontainers.core.container import DockerContainer
@@ -103,7 +88,7 @@ def aerospike_container() -> Iterator[dict[str, object]]:
     host_port = _find_free_port()
     conf_dir = Path(tempfile.mkdtemp(prefix="aerospike-test-"))
     conf_path = conf_dir / "aerospike.conf"
-    conf_path.write_text(_AEROSPIKE_CONF_TEMPLATE.format(access_port=host_port))
+    conf_path.write_text(_render_aerospike_conf(host_port))
 
     # NOTE: We mount at ``aerospike.template.conf``, not ``aerospike.conf``.
     # The image's entrypoint does ``bash``-style env-var substitution from the
@@ -118,8 +103,6 @@ def aerospike_container() -> Iterator[dict[str, object]]:
     )
     container.start()
 
-    # Wait for the server to accept client connections. Cluster tend takes a
-    # couple of seconds; allow up to 60s for slow CI.
     deadline = time.time() + 60
     last_err: Exception | None = None
     while time.time() < deadline:

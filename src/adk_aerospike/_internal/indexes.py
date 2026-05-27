@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from .schema import Schema
+from .schema import BinName, Schema
 
 if TYPE_CHECKING:
     import aerospike
@@ -42,8 +42,18 @@ def ensure_session_indexes(client: aerospike.Client, schema: Schema) -> None:
 
     indexes = (
         # (set, bin, type, index name)  — used by list_sessions(app, user)
-        (schema.sessions_set, "uid", "string", f"idx_{schema.set_prefix}sess_uid"),
-        (schema.sessions_set, "app", "string", f"idx_{schema.set_prefix}sess_app"),
+        (
+            schema.sessions_set,
+            BinName.USER_ID,
+            "string",
+            f"idx_{schema.set_prefix}sess_uid",
+        ),
+        (
+            schema.sessions_set,
+            BinName.APP_NAME,
+            "string",
+            f"idx_{schema.set_prefix}sess_app",
+        ),
     )
 
     for set_name, bin_name, kind, idx_name in indexes:
@@ -71,9 +81,18 @@ def ensure_artifact_indexes(client: aerospike.Client, schema: Schema) -> None:
 
     indexes = (
         # Composite tenant index — used by list_artifact_keys / _rows_for.
-        (schema.artifacts_set, "aus", "string", f"idx_{schema.set_prefix}art_aus"),
-        # Filename index — kept for completeness / direct filename queries.
-        (schema.artifacts_set, "fname", "string", f"idx_{schema.set_prefix}art_fname"),
+        (
+            schema.artifacts_set,
+            BinName.SCOPE_TUPLE,
+            "string",
+            f"idx_{schema.set_prefix}art_aus",
+        ),
+        (
+            schema.artifacts_set,
+            BinName.FILENAME,
+            "string",
+            f"idx_{schema.set_prefix}art_fname",
+        ),
     )
 
     for set_name, bin_name, kind, idx_name in indexes:
@@ -110,7 +129,7 @@ def ensure_memory_indexes(client: aerospike.Client, schema: Schema) -> None:
         client.index_single_value_create(
             schema.namespace,
             schema.memory_set,
-            "aus",
+            BinName.SCOPE_TUPLE,
             aerospike.INDEX_STRING,
             f"idx_{schema.set_prefix}mem_aus",
         )
@@ -123,7 +142,7 @@ def ensure_memory_indexes(client: aerospike.Client, schema: Schema) -> None:
         client.index_list_create(
             schema.namespace,
             schema.memory_set,
-            "keywords",
+            BinName.KEYWORDS,
             aerospike.INDEX_STRING,
             f"idx_{schema.set_prefix}mem_kw",
         )
