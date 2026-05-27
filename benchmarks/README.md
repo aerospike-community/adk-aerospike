@@ -46,7 +46,7 @@ python benchmarks/run.py --list-workloads
 | Workload | Real-world model | `aerospike_*` tests |
 |---|---|---|
 | `session_hotpath` | Multi-session agent loop | `session_append`, `session_get_recent`, `session_list` |
-| `memory_lexical` | Keyword memory over prior turns | `memory_search`, `memory_ingest` |
+| `memory_lexical` | Keyword memory over prior turns (posting-list PK search, not SI) | `memory_search`, `memory_ingest` |
 | `artifacts` | Tool JSON / uploads (~4 KiB inline) | `artifact_save`, `artifact_load`, `artifact_list_versions` |
 | `agent_turn` | **Composite** one turn | `agent_turn` (append → hydrate → search) |
 | `chunk_stress` | Long conversation on one session | `session_append_chunked` (forced flushes) |

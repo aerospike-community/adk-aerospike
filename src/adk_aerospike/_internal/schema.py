@@ -92,6 +92,7 @@ class BinName(StrEnum):
     EVENT_ID = "eid"
     TEXT = "text"
     KEYWORDS = "keywords"
+    MEM_POSTINGS = "mpl"
     EVENTS = "events"
     CHUNKS = "chunks"
     TAIL_BYTES = "tbytes"
@@ -385,7 +386,15 @@ BIN_REGISTRY: Final[dict[BinName, BinDefinition]] = {
         "list[str]",
         _MEMORY,
         frozenset({RecordKind.MEMORY}),
-        "Lowercase [A-Za-z]+ tokens; list-element secondary index for search_memory",
+        "Lowercase [A-Za-z]+ tokens; also drives posting-list maintenance on write",
+    ),
+    BinName.MEM_POSTINGS: _bin(
+        BinName.MEM_POSTINGS,
+        "memory posting list",
+        "list[map]",
+        _MEMORY,
+        frozenset({RecordKind.MEMORY}),
+        "Inverted index: list of {eid,sid,ts} refs on keys app:user:kw:token",
     ),
     BinName.EVENTS: _bin(
         BinName.EVENTS,
@@ -542,6 +551,7 @@ class Bins:
     EVENT_ID: Final = BinName.EVENT_ID
     TEXT: Final = BinName.TEXT
     KEYWORDS: Final = BinName.KEYWORDS
+    MEM_POSTINGS: Final = BinName.MEM_POSTINGS
     EVENTS: Final = BinName.EVENTS
     CHUNKS: Final = BinName.CHUNKS
     TAIL_BYTES: Final = BinName.TAIL_BYTES
