@@ -1,0 +1,13 @@
+{
+  "description": "Quick sanity check on a laptop or CI agent (~30s total).",
+  "workload": "session_hotpath",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 20,
+  "scheduler_thread_count": 1,
+  "worker_thread_count": 4,
+  "runtime_per_function": 5,
+  "workload_params": {
+    "session_count": 8,
+    "event_size_bytes": 200
+  }
+}

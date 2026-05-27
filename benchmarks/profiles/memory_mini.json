@@ -1,0 +1,13 @@
+{
+  "description": "Mini memory_heavy — 500-entry corpus, short run (local proof).",
+  "workload": "memory_lexical",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 20,
+  "scheduler_thread_count": 1,
+  "worker_thread_count": 8,
+  "runtime_per_function": 15,
+  "workload_params": {
+    "corpus": 500,
+    "query_tokens": 3
+  }
+}

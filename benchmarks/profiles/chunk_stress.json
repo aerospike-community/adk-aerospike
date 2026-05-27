@@ -1,0 +1,13 @@
+{
+  "description": "Single long session with forced chunk flushes (low flush threshold).",
+  "workload": "chunk_stress",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 100,
+  "scheduler_thread_count": 1,
+  "worker_thread_count": 8,
+  "runtime_per_function": 30,
+  "workload_params": {
+    "event_size_bytes": 600,
+    "flush_threshold_bytes": 200
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "description": "Tool-output sized JSON artifacts (~4 KiB inline).",
+  "workload": "artifacts",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 80,
+  "scheduler_thread_count": 2,
+  "worker_thread_count": 16,
+  "runtime_per_function": 30,
+  "workload_params": {
+    "payload_bytes": 4096
+  }
+}
