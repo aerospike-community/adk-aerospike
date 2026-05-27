@@ -35,6 +35,9 @@ A session literally named ``"user"`` would collide — same constraint upstream
 has.
 """
 
+ARTIFACT_HEAD_SUFFIX: Final = "__head__"
+"""Suffix on artifact version-counter records (not a stored artifact version)."""
+
 CHUNK_KEY_PREFIX: Final = "c:"
 """Prefix on the chunk-id suffix of chunk record keys, e.g. ``c:00000003``.
 
@@ -74,6 +77,18 @@ def artifact_key(
 ) -> str:
     return (
         f"{app_name}{SEP}{user_id}{SEP}{session_id}{SEP}{filename}{SEP}{version:08d}"
+    )
+
+
+def artifact_head_key(
+    app_name: str,
+    user_id: str,
+    session_id: str,
+    filename: str,
+) -> str:
+    """Primary key for the per-file version counter (``ver`` bin, atomically incremented)."""
+    return (
+        f"{app_name}{SEP}{user_id}{SEP}{session_id}{SEP}{filename}{SEP}{ARTIFACT_HEAD_SUFFIX}"
     )
 
 

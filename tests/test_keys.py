@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from adk_aerospike._internal.keys import (
+    ARTIFACT_HEAD_SUFFIX,
     SEP,
     app_state_key,
+    artifact_head_key,
     artifact_key,
     chunk_key,
     session_key,
@@ -50,3 +52,10 @@ def test_artifact_key_has_version_suffix():
     k = artifact_key("a", "u", "s", "file.png", 3)
     assert k.endswith(f"{SEP}00000003")
     assert "file.png" in k
+
+
+def test_artifact_head_key_distinct_from_versioned_key():
+    head = artifact_head_key("a", "u", "s", "file.png")
+    body = artifact_key("a", "u", "s", "file.png", 0)
+    assert head.endswith(ARTIFACT_HEAD_SUFFIX)
+    assert head != body

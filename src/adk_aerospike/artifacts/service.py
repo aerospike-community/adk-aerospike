@@ -4,8 +4,10 @@ Design
 ------
 Each ``(app, user, scope_id, filename, version)`` is its own record. The
 version is part of the primary key so reads of a specific version are a single
-GET. Listing versions is a secondary-index query on ``fname`` followed by an
-in-process filter on ``(app, user, scope_id)``.
+GET. New versions are allocated by a single-record ``operate(read(ver),
+increment(ver))`` on a sibling head key (``…:__head__``), not a query-then-put
+race. Listing versions is a secondary-index query on ``aus`` followed by an
+in-process filter on ``filename``.
 
 Filename scoping
 ~~~~~~~~~~~~~~~~
@@ -35,6 +37,7 @@ from .._internal.client import close_client, make_client
 from .._internal.indexes import ensure_artifact_indexes
 from .._internal.keys import (
     USER_SCOPE_SID,
+    artifact_head_key,
     artifact_key,
     artifact_scope_id,
     scope_tuple,
@@ -90,10 +93,7 @@ class AerospikeArtifactService(BaseArtifactService):
 
         part = ensure_part(artifact)
         scope_id = self._scope_id(filename, session_id)
-
-        # Version = number of existing versions (first save → 0).
-        existing = await self._versions_for(app_name, user_id, scope_id, filename)
-        version = (max(existing) + 1) if existing else 0
+        version = await self._allocate_version(app_name, user_id, scope_id, filename)
 
         mime_type = _mime_for_part(part)
         data_bytes = _bytes_for_part(part)
@@ -197,6 +197,11 @@ class AerospikeArtifactService(BaseArtifactService):
                 await asyncio.to_thread(self._client.remove, pk)
             except ae.RecordNotFound:
                 pass
+        head_pk = self._head_pk(app_name, user_id, scope_id, filename)
+        try:
+            await asyncio.to_thread(self._client.remove, head_pk)
+        except ae.RecordNotFound:
+            pass
 
     async def list_versions(
         self,
@@ -263,6 +268,32 @@ class AerospikeArtifactService(BaseArtifactService):
         except ValueError as e:
             raise InputValidationError(str(e)) from e
 
+    def _head_pk(
+        self, app_name: str, user_id: str, scope_id: str, filename: str
+    ) -> tuple[str, str, str]:
+        return (
+            self._schema.namespace,
+            self._schema.artifacts_set,
+            artifact_head_key(app_name, user_id, scope_id, filename),
+        )
+
+    async def _allocate_version(
+        self, app_name: str, user_id: str, scope_id: str, filename: str
+    ) -> int:
+        """Return the next version (0-based) via atomic read+increment on a head record."""
+        from aerospike_helpers.operations import operations as ops_
+
+        _, _, result = await asyncio.to_thread(
+            self._client.operate,
+            self._head_pk(app_name, user_id, scope_id, filename),
+            [
+                ops_.read(Bins.VERSION),
+                ops_.increment(Bins.VERSION, 1),
+            ],
+        )
+        current = result.get(Bins.VERSION)
+        return 0 if current is None else int(current)
+
     async def _versions_for(
         self, app_name: str, user_id: str, scope_id: str, filename: str
     ) -> list[int]:
@@ -310,8 +341,11 @@ class AerospikeArtifactService(BaseArtifactService):
         records = await asyncio.to_thread(query.results)
         out: list[tuple[int, dict[str, Any]]] = []
         for _, _, bins in records:
-            if bins.get(Bins.FILENAME) == filename:
-                out.append((bins.get(Bins.VERSION, 0), bins))
+            if bins.get(Bins.FILENAME) != filename:
+                continue
+            if Bins.DATA not in bins:
+                continue
+            out.append((bins.get(Bins.VERSION, 0), bins))
         return out
 
 
