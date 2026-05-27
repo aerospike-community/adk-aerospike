@@ -1,0 +1,100 @@
+# Build and publish to PyPI on version tags (v0.0.1, v0.0.2, …).
+# Requires PyPI trusted publishing + GitHub environment "pypi" — see RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Run unit tests
+        run: pytest -m "not aerospike" -v --tb=short
+
+      - name: Start Aerospike CE (Docker)
+        run: |
+          chmod +x scripts/start_aerospike_ce.sh scripts/stop_aerospike_ce.sh
+          ./scripts/start_aerospike_ce.sh
+
+      - name: Run integration tests
+        run: |
+          set -a
+          source .aerospike-ci.env
+          set +a
+          pytest -m aerospike -v --tb=short
+
+      - name: Stop Aerospike CE
+        if: always()
+        run: ./scripts/stop_aerospike_ce.sh
+
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          expected="${tag#v}"
+          actual="$(grep -E '^version = ' pyproject.toml | sed -E 's/^version = "(.*)"/\1/')"
+          if [ "$expected" != "$actual" ]; then
+            echo "Tag $tag implies version $expected but pyproject.toml has $actual"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: python -m pip install build && python -m build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/adk-aerospike
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
