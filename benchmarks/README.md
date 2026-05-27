@@ -1,111 +1,102 @@
 # Benchmarks
 
-Asyncio latency/throughput harness for `adk-aerospike`. Designed to falsify
-four specific design claims one at a time, not to drive sustained mixed
-workloads (use Locust for that).
+Two harnesses, one goal: measure `adk-aerospike` under realistic agent-shaped load.
 
-## Quick start
+| Harness | Runner | Use when |
+|---|---|---|
+| **Ecosystem** (`run.py`) | [ai-ecosystem-benchmark](https://github.com/aerospike-community/ai-ecosystem-benchmark) | Fixed QPS, coordinated-omission-safe latency, comparable across Aerospike / Postgres / Redis backends |
+| **Micro** (`benchmark.py`) | Standalone asyncio | Falsify a single design claim (append atomicity, chunk flush, tail read, sec-index search) |
+
+Long term, workloads should ship as a pip extra on this repo. Today the ecosystem framework is **not on PyPI** — install from git (see below).
+
+## Ecosystem harness (recommended for cross-backend runs)
+
+### Install
 
 ```bash
-# Default: localhost Aerospike on :3000, namespace "test"
-python benchmarks/benchmark.py append
-
-# All four scenarios with default parameters
-python benchmarks/benchmark.py all
-
-# Custom cluster + scale knobs
-python benchmarks/benchmark.py search \
-    --uri "aerospike://my-cluster:3000/adk?set_prefix=bench_" \
-    --corpus 100000 --ops 2000 --concurrency 64 --query-tokens 5
+pip install -e ".[dev,benchmark]"
+# benchmark extra pulls ai-ecosystem-benchmark from GitHub
 ```
 
-## What each scenario measures
+Or pin the framework checkout:
 
-| Scenario | Validates | What "good" looks like |
+```bash
+pip install "git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git"
+pip install -e .
+```
+
+### Run a profile
+
+```bash
+python benchmarks/run.py --list-profiles
+python benchmarks/run.py --profile smoke
+python benchmarks/run.py --profile agent_turn --uri "aerospike://127.0.0.1:3000/test?set_prefix=bench_"
+```
+
+Profiles live in `benchmarks/profiles/*.json` (QPS, thread pools, workload params). Override only the URI on the CLI; other knobs belong in the profile file so runs are reproducible.
+
+### Workloads
+
+Workloads subclass `BaseBenchmarkWorkload` and expose `aerospike_*` methods (sync wrappers over async ADK services). List them:
+
+```bash
+python benchmarks/run.py --list-workloads
+```
+
+| Workload | Real-world model | `aerospike_*` tests |
 |---|---|---|
-| `append` | `append_event` is a single-record server-side atomic op | Latency flat across concurrency; ops/s scales with concurrency until cluster saturates |
-| `chunking` | Chunked tail keeps each append cheap; flushes amortize | p50 sub-ms; p99 a few × p50 (periodic flush spikes); no catastrophic max |
-| `read` | `get_session` is one RTT when tail satisfies `num_recent_events` | Fast path flat vs chunk count; `--full-history` shows linear cost in chunks |
-| `search` | List-element sec-index keeps memory search sublinear in corpus size | Search latency grows with query token count, not corpus size |
+| `session_hotpath` | Multi-session agent loop | `session_append`, `session_get_recent`, `session_list` |
+| `memory_lexical` | Keyword memory over prior turns | `memory_search`, `memory_ingest` |
+| `artifacts` | Tool JSON / uploads (~4 KiB inline) | `artifact_save`, `artifact_load`, `artifact_list_versions` |
+| `agent_turn` | **Composite** one turn | `agent_turn` (append → hydrate → search) |
+| `chunk_stress` | Long conversation on one session | `session_append_chunked` (forced flushes) |
 
-## Reference numbers — local Aerospike CE, MacBook (M-series), single node
+Default sizing assumptions (tunable via `workload_params` in profiles):
 
-These are smoke-test numbers from a development laptop, not production capacity.
-Use them as a sanity check; numbers will be very different on real hardware.
+- Event text **200–600 B** (typical LLM turn + small state delta)
+- Recent context window **10–20 events** (`GetSessionConfig.num_recent_events`)
+- Memory corpus **5k–50k** text-bearing events; **3–4** query tokens (~1–5% hit rate per token with 256-word vocab)
+- Artifacts **4 KiB** JSON inline (under namespace write-block-size)
 
-```
-append (size=200B, concurrency=16)               ops/s=5670   p50=2.10ms  p99=3.77ms
-chunking (500 events, 600B each → 500 hydrated)  ops/s=1869   p50=0.47ms  p99=1.01ms
-get_session [num_recent_events=5] (50 chunks)    ops/s=1729   p50=8.67ms  p99=11.84ms
-get_session [full history]        (50 chunks)    ops/s=  43   p50=330ms   p99=683ms
-search_memory (corpus=500, 3 tokens)             ops/s= 191   p50=37.97ms p99=83.05ms
-```
+### Profiles
 
-Key reads from those numbers:
+| Profile | Workload | Intent |
+|---|---|---|
+| `smoke` | `session_hotpath` | Laptop / CI sanity (~5 s per test) |
+| `sustained` | `session_hotpath` | 60 s @ 200 QPS, 64 sessions |
+| `agent_turn` | `agent_turn` | End-to-end turn latency |
+| `memory_mini` | `memory_lexical` | 500-entry corpus, short local proof |
+| `memory_heavy` | `memory_lexical` | 50k corpus search |
+| `chunk_stress` | `chunk_stress` | Chunk flush under append load |
+| `artifacts` | `artifacts` | Save / load / list versions |
 
-- **`append_event` is sub-4ms p99** at 16-way concurrency, confirming the
-  single-record atomic-operate design.
-- **Chunking flush is non-disruptive**: p99=1ms despite 500 events spanning
-  many flushes; the max spike of 8ms is the flush itself, amortized over
-  ~300 events.
-- **Fast-path `get_session` is 40× faster than full-history**: the
-  `num_recent_events` / `batch_read` design wins exactly where the design
-  predicted.
-- **Search at 500 entries is 38ms p50**: dominated by issuing 3 indexed
-  queries per call (one per query token). Scale this up to find the corpus
-  size where it tips over.
+### Adding a workload
 
-## CLI reference
+1. Create `benchmarks/workloads/my_workload.py` subclassing `BaseBenchmarkWorkload`.
+2. Implement `setup` / `between_benchmarks` / `teardown`.
+3. Add `aerospike_*` methods (one measurable op each; use `run_async()` from `_async_bridge.py`).
+4. Register in `benchmarks/workloads/__init__.py`.
+5. Add a JSON profile under `benchmarks/profiles/`.
 
-```
-positional:  scenario  {append, chunking, read, search, all}
+When `ai-ecosystem-benchmark` lands on PyPI, change the `[benchmark]` extra to a version pin and drop the git URL.
 
-connection:
-  --uri URI                 default: aerospike://127.0.0.1:3000/test
+## Micro harness (design validation)
 
-common knobs:
-  --ops N                   default: 2000
-  --concurrency N           default: 32
-  --event-size BYTES        default: 200    (append, chunking)
+Asyncio script with client-side percentiles. Does **not** use the ecosystem runner.
 
-scenario-specific:
-  --events N                default: 5000   (chunking: events per single session)
-  --chunks N                default: 10     (read: sealed chunks to pre-build)
-  --full-history            default: off    (read: walk all chunks instead of fast path)
-  --corpus N                default: 5000   (search: memories to preload)
-  --query-tokens N          default: 3      (search: tokens per query)
+```bash
+python benchmarks/benchmark.py append
+python benchmarks/benchmark.py all
 ```
 
-## Suggestions for getting useful numbers
+See scenario table in the docstring — `append`, `chunking`, `read`, `search` map to schema design claims (single-record atomic append, tail vs full history, list-element index).
 
-1. **Run against a real cluster** — single-node Docker on macOS is bottlenecked
-   by Docker networking, not Aerospike. Either bind-mount with host networking
-   or, better, point at a real 3-node deployment.
+## What neither harness does
 
-2. **Sweep, don't single-shot.** The interesting question isn't "what's p99 at
-   N=2000?" but "how does p99 change with concurrency / corpus / chunk
-   count?" Wrap the script in a shell loop and chart the outputs.
+- Mixed workloads at a single QPS mix (use separate profiles or Locust)
+- Strong-consistency / cross-DC / MRT scenarios
+- Cluster-side metrics (run `asadm` or your observability stack in parallel)
 
-3. **Watch the cluster, not just the client.** Run `asadm` in another terminal
-   and look at the `latency` histograms while the benchmark runs — they tell
-   you whether you're seeing client-side queueing or actual server latency.
+## Data isolation
 
-4. **Mind the warmup.** First few hundred ops include JIT, connection setup,
-   secondary-index page-ins. Either discard the first 10% of samples or run
-   with `--ops` large enough that warmup is noise.
-
-5. **Don't trust microbenchmarks for capacity planning.** This harness shows
-   relative behavior of design choices. For real capacity planning, run
-   Locust against a production-shaped workload on production-shaped hardware
-   and measure under your actual concurrency target.
-
-## What this harness deliberately does NOT do
-
-- **No mixed workloads.** Use Locust if you want session-create + reads +
-  appends + searches happening together.
-- **No replication / SC / MRT measurement.** Wire your cluster appropriately
-  before testing those.
-- **No cluster-side metric collection.** Run `asadm`, `aerospike-prometheus-exporter`,
-  or your standard observability stack in parallel.
-- **No long-running stability test.** Run for hours/days with Locust if that's
-  what you want to measure.
+Ecosystem workloads use `bench_eco_*` app names and `set_prefix=bench_` by default so they do not collide with tests or dev data. Tear down via workload `teardown()` or delete the bench namespace prefix manually.

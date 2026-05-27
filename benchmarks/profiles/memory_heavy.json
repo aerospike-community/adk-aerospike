@@ -1,0 +1,13 @@
+{
+  "description": "Lexical memory search against a 50k-entry corpus.",
+  "workload": "memory_lexical",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 30,
+  "scheduler_thread_count": 2,
+  "worker_thread_count": 16,
+  "runtime_per_function": 60,
+  "workload_params": {
+    "corpus": 50000,
+    "query_tokens": 4
+  }
+}

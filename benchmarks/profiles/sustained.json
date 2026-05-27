@@ -1,0 +1,14 @@
+{
+  "description": "Steady multi-session agent traffic at moderate QPS.",
+  "workload": "session_hotpath",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 200,
+  "scheduler_thread_count": 4,
+  "worker_thread_count": 32,
+  "runtime_per_function": 60,
+  "workload_params": {
+    "session_count": 64,
+    "event_size_bytes": 400,
+    "recent_events": 20
+  }
+}
