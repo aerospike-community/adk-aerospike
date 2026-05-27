@@ -1,6 +1,6 @@
 # adk-aerospike
 
-[![Tests](https://github.com/ggeorges-aerospike/adk-aerospike/actions/workflows/tests.yml/badge.svg)](https://github.com/ggeorges-aerospike/adk-aerospike/actions/workflows/tests.yml)
+[![Tests](https://github.com/aerospike-community/adk-aerospike/actions/workflows/tests.yml/badge.svg)](https://github.com/aerospike-community/adk-aerospike/actions/workflows/tests.yml)
 
 Aerospike-backed storage services for [Google Agent Development Kit (ADK)](https://adk.dev/).
 
