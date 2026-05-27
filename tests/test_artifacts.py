@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -316,6 +317,25 @@ async def test_list_versions_isolated_across_apps_with_same_filename(
     )
     assert a_versions == [0, 1]
     assert b_versions == [0]
+
+
+async def test_concurrent_saves_get_distinct_versions(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Parallel saves to the same filename must not collide on version keys."""
+
+    async def one(i: int) -> int:
+        return await artifact_service.save_artifact(
+            app_name="conc",
+            user_id="u",
+            session_id="s",
+            filename="out.bin",
+            artifact=genai_types.Part(text=f"v{i}"),
+        )
+
+    versions = await asyncio.gather(*(one(i) for i in range(32)))
+    assert len(set(versions)) == 32
+    assert sorted(versions) == list(range(32))
 
 
 async def test_list_versions_returns_sorted(
