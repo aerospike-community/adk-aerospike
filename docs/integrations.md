@@ -78,5 +78,5 @@ adk web --session_db_url=aerospike://localhost:3000/adk
 
 ## Resources
 
-- [adk-aerospike on GitHub](https://github.com/aerospike/adk-aerospike)
+- [adk-aerospike on GitHub](https://github.com/aerospike-community/adk-aerospike)
 - [Aerospike documentation](https://aerospike.com/docs/)

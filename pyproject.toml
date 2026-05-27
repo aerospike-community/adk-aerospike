@@ -38,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/aerospike/adk-aerospike"
-Repository = "https://github.com/aerospike/adk-aerospike"
-Issues = "https://github.com/aerospike/adk-aerospike/issues"
+Homepage = "https://github.com/aerospike-community/adk-aerospike"
+Repository = "https://github.com/aerospike-community/adk-aerospike"
+Issues = "https://github.com/aerospike-community/adk-aerospike/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/adk_aerospike"]
