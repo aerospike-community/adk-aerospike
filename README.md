@@ -4,7 +4,7 @@
 
 Aerospike-backed storage services for [Google Agent Development Kit (ADK)](https://adk.dev/).
 
-**Status:** alpha (0.0.1). All three ADK storage interfaces implemented end-to-end against ADK 2.x.
+**Status:** alpha (0.0.2). All three ADK storage interfaces implemented end-to-end against ADK 2.x.
 
 ## What's in here
 

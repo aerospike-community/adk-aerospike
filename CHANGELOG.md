@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-05-28
+
 ### Added
 
 - Per-user session manifest (`app:user:sl`) and bin-projected `list_sessions(app, user)` metadata reads.
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AerospikeSessionService.list_sessions` with `user_id` reads the session manifest instead of scanning `idx_*_sess_uid`.
 - Inline event codec bumped to v2: full `Event.model_dump` stored under `payload` for lossless round-trip (v0/v1 records remain readable).
 
+### Fixed
+
+- Concurrent `save_artifact` calls allocate distinct versions via atomic `operate` on a per-file head record (`:__head__`).
+
 ## [0.0.1] - 2026-05-27
 
 ### Added
@@ -32,4 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `aerospike://` URI support via `adk_aerospike.register()`.
 - Chunked session records, server-side lexical memory search, and composite tenant indexes.
 
+[Unreleased]: https://github.com/aerospike-community/adk-aerospike/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/aerospike-community/adk-aerospike/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/aerospike-community/adk-aerospike/releases/tag/v0.0.1
