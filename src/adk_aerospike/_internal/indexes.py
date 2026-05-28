@@ -34,14 +34,14 @@ def ensure_session_indexes(client: aerospike.Client, schema: Schema) -> None:
 
     Note: the sessions set holds both session records and chunk records.
     Chunk records deliberately omit the ``app``/``uid``/``sid`` bins so they
-    don't appear in these indexes — ``list_sessions`` queries return session
-    records only, without a client-side filter step.
+    don't appear in these indexes. ``list_sessions(app, user)`` uses the
+    ``app:user:sl`` manifest (PK + bin-projected ``batch_write`` reads), not these indexes.
     """
     import aerospike
     from aerospike import exception as ae
 
     indexes = (
-        # (set, bin, type, index name)  — used by list_sessions(app, user)
+        # (set, bin, type, index name)  — used by list_sessions(app) without user_id
         (
             schema.sessions_set,
             BinName.USER_ID,

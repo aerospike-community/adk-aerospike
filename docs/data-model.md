@@ -11,7 +11,7 @@ the package uses these sets (default prefix `adk_`, configurable):
 
 | Set              | Primary key                                                                                   | Purpose                                                                     |
 | ---------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `adk_sessions`   | `app : user : session` (session record) or `app : user : session : c:NNNNNNNN` (chunk record) | One session record per session; one chunk record per sealed batch of events |
+| `adk_sessions`   | `app : user : session` (session), `app : user : session : c:NNNNNNNN` (chunk), or `app : user : sl` (session manifest) | Session rows, sealed event chunks, and per-user session-id list |
 | `adk_app_state`  | `app`                                                                                         | App-scoped state (`app:` prefixed keys)                                     |
 | `adk_user_state` | `app : user`                                                                                  | User-scoped state (`user:` prefixed keys)                                   |
 | `adk_artifacts`  | `app : user : session : filename : version:08d`                                               | Versioned binary artifacts                                                  |
@@ -84,7 +84,9 @@ Default prefix `adk_` → full set name `{prefix}{suffix}`.
 | `cmeta`    | `CUSTOM_META`    | custom metadata                  | Map       | artifacts                       | artifact                               |
 | `eid`      | `EVENT_ID`       | event identifier                 | string    | memory                          | memory                                 |
 | `text`     | `TEXT`           | extracted plain text             | string    | memory                          | memory                                 |
-| `keywords` | `KEYWORDS`       | search keywords                  | list[str] | memory                          | memory                                 |
+| `keywords` | `KEYWORDS`       | search keywords                  | list[str] | memory                          | memory row (posting-list maintenance)  |
+| `mpl`      | `MEM_POSTINGS`   | memory posting list              | list[map] | memory                          | posting row (`app:user:kw:token`)      |
+| `sman`     | `SESSION_MANIFEST` | session id manifest            | list[str] | sessions                        | manifest row (`app:user:sl`)           |
 | `author`   | `AUTHOR`         | event author                     | string    | memory                          | memory                                 |
 | `content`  | `CONTENT`        | event content                    | Map       | memory                          | memory                                 |
 
@@ -98,8 +100,9 @@ filenames. Sec-indexed so tenant-scoped queries (`list_artifact_keys`,
 `**sid` on artifacts:** session id, or `"user"` for user-scoped artifacts
 (same constraint as upstream `InMemoryArtifactService`).
 
-Chunk records **omit** `app`, `uid`, and `sid` so they do not appear in
-`idx_*_sess_uid` / `idx_*_sess_app` — `list_sessions` returns session rows only.
+Chunk records **omit** `app`, `uid`, and `sid` so they are not confused with
+session rows. **`list_sessions` does not use those indexes** when `user_id` is
+set (see below).
 
 ### Inline event Map fields (inside `events` List)
 
@@ -166,10 +169,18 @@ Not Aerospike bins — keys within each List element. Defined by
 | `aus`      | str       | composite `app:user:sid` — sec-indexed for purge         |
 | `eid`      | str       | event id                                                 |
 | `text`     | str       | extracted text content                                   |
-| `keywords` | list[str] | tokenized — list-element sec-indexed for `search_memory` |
+| `keywords` | list[str] | tokenized terms; maintained on write for posting-list updates |
+| `mpl`      | list[map] | **Posting row only** (`app:user:kw:token`): `{eid,sid,ts}` refs |
 | `author`   | str       | event author                                             |
 | `ts`       | float     | event timestamp                                          |
 | `content`  | Map       | full event content (for reconstruction)                  |
+
+**Posting rows** share the `adk_memory` set but use primary keys
+`app:user:kw:<token>` (see `keys.memory_posting_key`). `search_memory` does
+`batch_read` on those keys (one per query token), unions candidate event refs,
+then `batch_read` on the memory rows — no list-element secondary index on search.
+
+**Memory row** keys remain `app:user:session:event_id`.
 
 
 ### `adk_sessions` — chunk record (key suffix `: c:NNNNNNNN`)
@@ -183,9 +194,26 @@ Not Aerospike bins — keys within each List element. Defined by
 | `ts_hi`  | float | timestamp of last event in chunk                                   |
 
 
-Chunks deliberately **omit `app`/`uid`/`sid` bins** so they are invisible to
-the `idx_sess_uid` / `idx_sess_app` secondary indexes — `list_sessions`
-returns session records only.
+Chunks deliberately **omit `app`/`uid`/`sid` bins** so they are never listed as
+sessions.
+
+### `adk_sessions` — session manifest (key suffix `:sl`)
+
+| Bin    | Type      | Notes |
+| ------ | --------- | ----- |
+| `sman` | list[str] | Session ids for this `(app_name, user_id)` |
+
+Primary key: `app:user:sl` (`keys.session_manifest_key`). **Not a session row.**
+
+- **`create_session`** appends `sid` to `sman` via `list_append`.
+- **`delete_session`** removes `sid` from `sman`.
+- **`list_sessions(app, user)`** — `GET` manifest, then **bin-projected**
+  `batch_write` reads on each session PK (`app`, `uid`, `sid`, `ts` only — no
+  `events` or `state`). Stale manifest entries (missing session row) are
+  removed on read.
+
+`list_sessions(app)` **without** `user_id` still queries `idx_*_sess_app` and
+filters in Python (cold path).
 
 ### Event item shape (inside the `events` List)
 
@@ -230,12 +258,11 @@ Required for the operations below; create on first connect (idempotent).
 
 | Index name              | Set             | Bin        | Type                | Used by                                                                             |
 | ----------------------- | --------------- | ---------- | ------------------- | ----------------------------------------------------------------------------------- |
-| `idx_<prefix>sess_uid`  | `adk_sessions`  | `uid`      | string              | `list_sessions(user_id=…)`                                                          |
-| `idx_<prefix>sess_app`  | `adk_sessions`  | `app`      | string              | `list_sessions(app_name=…)`                                                         |
+| `idx_<prefix>sess_uid`  | `adk_sessions`  | `uid`      | string              | Legacy / unused for `list_sessions(app, user)` — prefer manifest                   |
+| `idx_<prefix>sess_app`  | `adk_sessions`  | `app`      | string              | `list_sessions(app_name=…)` only (no `user_id`)                                     |
 | `idx_<prefix>art_aus`   | `adk_artifacts` | `aus`      | string              | `list_artifact_keys` / `list_versions` / `load_artifact` (composite app:user:scope) |
 | `idx_<prefix>art_fname` | `adk_artifacts` | `fname`    | string              | direct filename lookups (kept for completeness)                                     |
 | `idx_<prefix>mem_aus`   | `adk_memory`    | `aus`      | string              | `add_session_to_memory` purge step (composite app:user:session)                     |
-| `idx_<prefix>mem_kw`    | `adk_memory`    | `keywords` | list-element string | `search_memory` keyword lookup                                                      |
 
 
 **Composite tenant indexes (`aus` = "app:user:scope")** are the load-bearing

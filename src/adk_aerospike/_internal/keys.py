@@ -41,6 +41,9 @@ ARTIFACT_HEAD_SUFFIX: Final = "__head__"
 MEMORY_KW_PREFIX: Final = "kw"
 """Infix in memory posting-list keys: ``app:user:kw:token`` (not a memory row)."""
 
+SESSION_MANIFEST_SUFFIX: Final = "sl"
+"""Suffix for per-user session-id manifest: ``app:user:sl`` (not a session row)."""
+
 CHUNK_KEY_PREFIX: Final = "c:"
 """Prefix on the chunk-id suffix of chunk record keys, e.g. ``c:00000003``.
 
@@ -110,6 +113,11 @@ def artifact_scope_id(filename: str, session_id: str | None) -> str:
 
 def memory_key(app_name: str, user_id: str, session_id: str, event_id: str) -> str:
     return f"{app_name}{SEP}{user_id}{SEP}{session_id}{SEP}{event_id}"
+
+
+def session_manifest_key(app_name: str, user_id: str) -> str:
+    """Primary key for the session-id list for ``(app_name, user_id)``."""
+    return f"{app_name}{SEP}{user_id}{SEP}{SESSION_MANIFEST_SUFFIX}"
 
 
 def memory_posting_key(app_name: str, user_id: str, token: str) -> str:
