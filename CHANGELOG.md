@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Posting-list inverted index for lexical memory search (`app:user:kw:<token>` primary keys).
 - Data-model diagrams and updated `docs/data-model.md` (manifests, posting rows, artifact head records).
 - Ecosystem benchmarks: `--backend redis`, `--results-dir`, `paired_*` profiles, and `[benchmark]` extras (`google-adk-extras`, `redis`, `sqlalchemy`).
+- `benchmarks/workloads/_redis_backend.py` and `redis_*` methods on ecosystem workloads for cross-backend comparison via `google-adk-extras`.
 
 ### Changed
 
