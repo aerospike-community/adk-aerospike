@@ -23,4 +23,4 @@ htmlcov/
 *.swp
 .DS_Store
 .claude/
-benchmarks/results/**/*.log
+benchmarks/results/
