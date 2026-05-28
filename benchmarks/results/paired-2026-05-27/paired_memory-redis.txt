@@ -1,0 +1,12 @@
+
+=== Benchmark Metrics (ms) ===
+
+[aerospike]
+  (no tests run)
+
+[postgres]
+  (no tests run)
+
+[redis]
+  redis_memory_ingest: calls=300 failures=0  p50=1ms  p90=1ms  p99=1ms
+  redis_memory_search: calls=300 failures=0  p50=8858ms  p90=15703ms  p99=17046ms

@@ -1,0 +1,12 @@
+
+=== Benchmark Metrics (ms) ===
+
+[aerospike]
+  aerospike_memory_ingest: calls=1800 failures=0  p50=7ms  p90=7ms  p99=9ms
+  aerospike_memory_search: calls=1800 failures=0  p50=12ms  p90=16ms  p99=19ms
+
+[postgres]
+  (no tests run)
+
+[redis]
+  (no tests run)

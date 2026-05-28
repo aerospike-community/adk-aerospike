@@ -1,0 +1,11 @@
+
+=== Benchmark Metrics (ms) ===
+
+[aerospike]
+  aerospike_agent_turn: calls=120 failures=0  p50=14ms  p90=17ms  p99=104ms
+
+[postgres]
+  (no tests run)
+
+[redis]
+  (no tests run)

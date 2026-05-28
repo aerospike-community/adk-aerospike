@@ -31,9 +31,11 @@ pip install -e .
 python benchmarks/run.py --list-profiles
 python benchmarks/run.py --profile smoke
 python benchmarks/run.py --profile agent_turn --uri "aerospike://127.0.0.1:3000/test?set_prefix=bench_"
+python benchmarks/run.py --profile paired_session --backend aerospike
+python benchmarks/run.py --profile paired_session --backend redis --uri "redis://127.0.0.1:6379/10"
 ```
 
-Profiles live in `benchmarks/profiles/*.json` (QPS, thread pools, workload params). Override only the URI on the CLI; other knobs belong in the profile file so runs are reproducible.
+Profiles live in `benchmarks/profiles/*.json` (QPS, thread pools, workload params). **`paired_*` profiles** use identical load for Aerospike vs Redis comparisons. Override URI and `--backend` (`aerospike` default, `redis` for google-adk-extras) on the CLI; use `--results-dir` to save metric transcripts.
 
 ### Workloads
 
@@ -69,6 +71,10 @@ Default sizing assumptions (tunable via `workload_params` in profiles):
 | `memory_heavy` | `memory_lexical` | 50k corpus search |
 | `chunk_stress` | `chunk_stress` | Chunk flush under append load |
 | `artifacts` | `artifacts` | Save / load / list versions |
+| `paired_smoke` | `session_hotpath` | Paired compare @ light load |
+| `paired_session` | `session_hotpath` | Paired compare @ 50 QPS, 32 sessions |
+| `paired_memory` | `memory_lexical` | Paired compare @ 2k corpus |
+| `paired_agent_turn` | `agent_turn` | Paired composite turn @ 8 QPS |
 
 ### Adding a workload
 
@@ -89,7 +95,7 @@ python benchmarks/benchmark.py append
 python benchmarks/benchmark.py all
 ```
 
-See scenario table in the docstring — `append`, `chunking`, `read`, `search` map to schema design claims (single-record atomic append, tail vs full history, list-element index).
+See scenario table in the docstring — `append`, `chunking`, `read`, `search` map to schema design claims (single-record atomic append, tail vs full history, posting-list memory search).
 
 ## What neither harness does
 

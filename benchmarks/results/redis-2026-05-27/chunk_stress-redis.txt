@@ -1,0 +1,11 @@
+
+=== Benchmark Metrics (ms) ===
+
+[aerospike]
+  (no tests run)
+
+[postgres]
+  (no tests run)
+
+[redis]
+  redis_session_append_chunked: calls=3000 failures=0  p50=32481ms  p90=125628ms  p99=154619ms

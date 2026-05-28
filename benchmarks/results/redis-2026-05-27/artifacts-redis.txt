@@ -1,0 +1,13 @@
+
+=== Benchmark Metrics (ms) ===
+
+[aerospike]
+  (no tests run)
+
+[postgres]
+  (no tests run)
+
+[redis]
+  redis_artifact_list_versions: calls=2400 failures=0  p50=1ms  p90=1ms  p99=1ms
+  redis_artifact_load: calls=2400 failures=0  p50=1ms  p90=1ms  p99=1ms
+  redis_artifact_save: calls=2400 failures=0  p50=1ms  p90=1ms  p99=1ms
