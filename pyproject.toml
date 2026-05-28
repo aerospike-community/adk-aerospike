@@ -36,20 +36,11 @@ dev = [
     "ruff >= 0.6",
     "mypy >= 1.10",
 ]
-benchmark = [
-    "ai-ecosystem-benchmark @ git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git",
-    "google-adk-extras >= 0.3",
-    "redis >= 5",
-    "sqlalchemy >= 2",
-]
 
 [project.urls]
 Homepage = "https://github.com/aerospike-community/adk-aerospike"
 Repository = "https://github.com/aerospike-community/adk-aerospike"
 Issues = "https://github.com/aerospike-community/adk-aerospike/issues"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/adk_aerospike"]

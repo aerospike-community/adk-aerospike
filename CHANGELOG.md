@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Drop `[benchmark]` optional extra from PyPI metadata; use `benchmarks/requirements.txt` instead (PyPI rejects VCS direct dependencies).
+
 ## [0.0.2] - 2026-05-28
 
 ### Added
@@ -14,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-user session manifest (`app:user:sl`) and bin-projected `list_sessions(app, user)` metadata reads.
 - Posting-list inverted index for lexical memory search (`app:user:kw:<token>` primary keys).
 - Data-model diagrams and updated `docs/data-model.md` (manifests, posting rows, artifact head records).
-- Ecosystem benchmarks: `--backend redis`, `--results-dir`, `paired_*` profiles, and `[benchmark]` extras (`google-adk-extras`, `redis`, `sqlalchemy`).
+- Ecosystem benchmarks: `--backend redis`, `--results-dir`, `paired_*` profiles; deps in `benchmarks/requirements.txt` (`google-adk-extras`, `redis`, `sqlalchemy`).
 - `benchmarks/workloads/_redis_backend.py` and `redis_*` methods on ecosystem workloads for cross-backend comparison via `google-adk-extras`.
 - `AerospikeMemoryService.add_events_to_memory` (incremental event ingest with dedupe by event id).
 - Upstream ADK contract tests ported from `google/adk-python` for sessions, artifacts, and memory.
