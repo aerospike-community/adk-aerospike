@@ -44,11 +44,20 @@ In https://github.com/aerospike-community/adk-aerospike/settings/environments:
 1. Bump version in **both** `pyproject.toml` and `src/adk_aerospike/__init__.py`.
 2. Update `CHANGELOG.md`.
 3. Merge to `main`.
-4. Tag and push:
+4. Tag the **current `main` HEAD** (after your release PR is merged) and push:
 
    ```bash
-   git tag v0.0.1
-   git push origin v0.0.1
+   git checkout main && git pull
+   git tag v0.0.2
+   git push origin v0.0.2
+   ```
+
+   If a tag already exists on an older commit, delete it locally and on GitHub before re-tagging:
+
+   ```bash
+   git tag -d v0.0.2
+   git push origin :refs/tags/v0.0.2
+   git tag v0.0.2 && git push origin v0.0.2
    ```
 
 5. In GitHub Actions, open the **Release** workflow run; approve the **pypi** environment deployment if reviewers are configured.
@@ -71,8 +80,11 @@ In https://github.com/aerospike-community/adk-aerospike/settings/environments:
 ```bash
 python -m pip install build
 python -m build
+python scripts/validate_pypi_metadata.py
 pip install dist/adk_aerospike-*.whl
 ```
+
+Benchmark harness deps are **not** in the PyPI package — install with `pip install -r benchmarks/requirements.txt`.
 
 ## Troubleshooting
 
@@ -81,4 +93,6 @@ pip install dist/adk_aerospike-*.whl
 | Publish job fails immediately on OIDC | Trusted publisher owner/repo/workflow/environment mismatch |
 | “File already exists” on upload | Version not bumped; PyPI versions are immutable |
 | Tag/job fails at version check | Tag `v0.0.2` but `pyproject.toml` still `0.0.1` |
+| `400 Can't have direct dependency` on upload | Tag points at a commit before the fix, or `[benchmark]` / git URL still in `pyproject.toml`; run `python scripts/validate_pypi_metadata.py` after `python -m build` |
+| Validate step fails on release | Wheel still embeds VCS deps — remove optional extras with git URLs from `pyproject.toml` |
 | Environment never appears | Workflow must reference `environment: name: pypi` on the publish job |
