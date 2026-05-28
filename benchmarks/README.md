@@ -7,22 +7,14 @@ Two harnesses, one goal: measure `adk-aerospike` under realistic agent-shaped lo
 | **Ecosystem** (`run.py`) | [ai-ecosystem-benchmark](https://github.com/aerospike-community/ai-ecosystem-benchmark) | Fixed QPS, coordinated-omission-safe latency, comparable across Aerospike / Postgres / Redis backends |
 | **Micro** (`benchmark.py`) | Standalone asyncio | Falsify a single design claim (append atomicity, chunk flush, tail read, sec-index search) |
 
-Long term, workloads should ship as a pip extra on this repo. Today the ecosystem framework is **not on PyPI** — install from git (see below).
+Benchmark deps live in `benchmarks/requirements.txt` (not published on PyPI — upload.pypi.org rejects VCS URLs in package metadata). The ecosystem framework is **not on PyPI** yet.
 
 ## Ecosystem harness (recommended for cross-backend runs)
 
 ### Install
 
 ```bash
-pip install -e ".[dev,benchmark]"
-# benchmark extra pulls ai-ecosystem-benchmark from GitHub
-```
-
-Or pin the framework checkout:
-
-```bash
-pip install "git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git"
-pip install -e .
+pip install -r benchmarks/requirements.txt
 ```
 
 ### Run a profile
@@ -84,7 +76,7 @@ Default sizing assumptions (tunable via `workload_params` in profiles):
 4. Register in `benchmarks/workloads/__init__.py`.
 5. Add a JSON profile under `benchmarks/profiles/`.
 
-When `ai-ecosystem-benchmark` lands on PyPI, change the `[benchmark]` extra to a version pin and drop the git URL.
+When `ai-ecosystem-benchmark` lands on PyPI, pin it in `benchmarks/requirements.txt` and drop the git URL.
 
 ## Micro harness (design validation)
 

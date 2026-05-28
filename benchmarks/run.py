@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Run adk-aerospike workloads through ai-ecosystem-benchmark.
 
-Install the framework (not on PyPI yet):
+Install benchmark deps (not part of the PyPI wheel):
 
-    pip install -e ".[benchmark]"
-    # or: pip install "git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git"
+    pip install -r benchmarks/requirements.txt
 
 Usage:
 
@@ -33,10 +32,7 @@ def _require_framework() -> tuple[Any, Any]:
     except ImportError:
         print(
             "ai-ecosystem-benchmark is not installed.\n\n"
-            "  pip install -e \".[benchmark]\"\n"
-            "  # or\n"
-            "  pip install "
-            "\"git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git\"\n",
+            "  pip install -r benchmarks/requirements.txt\n",
             file=sys.stderr,
         )
         sys.exit(1)
