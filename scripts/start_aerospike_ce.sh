@@ -48,11 +48,31 @@ docker run -d \
   -v "${CONF_DIR}/aerospike.conf:/etc/aerospike/aerospike.template.conf:ro" \
   "$IMAGE"
 
-echo "Waiting for Aerospike CE to accept connections (up to 90s) ..."
+echo "Waiting for Aerospike CE process (asinfo inside container, up to 90s) ..."
 deadline=$((SECONDS + 90))
 until docker exec "$CONTAINER_NAME" asinfo -v status 2>/dev/null | grep -qE 'ok|normal'; do
   if (( SECONDS >= deadline )); then
     echo "Aerospike CE did not become ready in time. Container logs:" >&2
+    docker logs "$CONTAINER_NAME" 2>&1 | tail -80 >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+# asinfo succeeding inside the container does not guarantee the mapped host port
+# accepts client connections yet (cluster tend / access-address propagation).
+# Mirror tests/conftest.py: probe from the host with the official Python client.
+echo "Waiting for host-side client connections on 127.0.0.1:${HOST_PORT} (up to 90s) ..."
+host_deadline=$((SECONDS + 90))
+until python3 -c "
+import aerospike
+c = aerospike.client({'hosts': [('127.0.0.1', ${HOST_PORT})]})
+c.connect()
+c.close()
+" 2>/dev/null; do
+  if (( SECONDS >= host_deadline )); then
+    echo "Aerospike CE did not accept host-side client connections in time." >&2
+    echo "Check access-address/access-port in ${TEMPLATE} and port mapping ${HOST_PORT}:3000." >&2
     docker logs "$CONTAINER_NAME" 2>&1 | tail -80 >&2 || true
     exit 1
   fi
