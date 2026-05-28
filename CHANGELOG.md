@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-user session manifest (`app:user:sl`) and bin-projected `list_sessions(app, user)` metadata reads.
+- Posting-list inverted index for lexical memory search (`app:user:kw:<token>` primary keys).
+- Data-model diagrams and updated `docs/data-model.md` (manifests, posting rows, artifact head records).
+- Ecosystem benchmarks: `--backend redis`, `--results-dir`, `paired_*` profiles, and `[benchmark]` extras (`google-adk-extras`, `redis`, `sqlalchemy`).
+
+### Changed
+
+- `AerospikeMemoryService.search_memory` uses posting-list `batch_read` per query token (no list-element secondary index on `keywords`).
+- `AerospikeSessionService.list_sessions` with `user_id` reads the session manifest instead of scanning `idx_*_sess_uid`.
+
 ## [0.0.1] - 2026-05-27
 
 ### Added
