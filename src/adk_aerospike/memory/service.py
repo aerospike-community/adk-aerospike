@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, Self
 
 from google.adk.memory import BaseMemoryService
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
     from google.adk.sessions import Session
 
 log = logging.getLogger(__name__)
+
+_UNKNOWN_SESSION_ID: Final = "__unknown_session_id__"
 
 _WORD_RE = re.compile(r"[A-Za-z]+")
 
@@ -133,6 +136,38 @@ class AerospikeMemoryService(BaseMemoryService):
                 app_name=session.app_name,
                 user_id=session.user_id,
                 session_id=session.id,
+                event=event,
+                text=text,
+            )
+
+    async def add_events_to_memory(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        events: Sequence[Event],
+        session_id: str | None = None,
+        custom_metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        _ = custom_metadata
+        scoped_session_id = session_id or _UNKNOWN_SESSION_ID
+        for event in events:
+            if not event.content or not event.content.parts:
+                continue
+            text = extract_event_text(event)
+            if not text:
+                continue
+            pk = (
+                self._schema.namespace,
+                self._schema.memory_set,
+                memory_key(app_name, user_id, scoped_session_id, event.id),
+            )
+            if (await self._batch_read([pk])).get(pk):
+                continue
+            await self._upsert_memory(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=scoped_session_id,
                 event=event,
                 text=text,
             )

@@ -30,12 +30,10 @@ if TYPE_CHECKING:
 def event_to_inline_dict(event: Event) -> dict[str, Any]:
     """Project an Event onto the Map shape we store inside the events list.
 
-    Keeps the field set small — no denormalised ``app``/``uid``/``sid`` (those
-    live on the parent session record) and no per-event ``seq`` (position in
-    the merged list already encodes order).
-
-    Emits ``_v`` for forward compatibility: readers can dispatch by version
-    if we ever need to change the schema without a full migration.
+    v2 records store the full ``Event.model_dump(mode="json")`` under
+    ``EventFieldName.PAYLOAD`` for lossless round-trip, plus denormalised
+    ``eid``/``ts``/``author`` for chunk pruning and debugging. v0/v1 slim
+    records remain readable via :func:`event_from_inline_dict`.
     """
     dump = event.model_dump(mode="json")
     return {
@@ -43,17 +41,19 @@ def event_to_inline_dict(event: Event) -> dict[str, Any]:
         EventFieldName.EVENT_ID: dump.get("id"),
         EventFieldName.TIMESTAMP: dump.get("timestamp", 0.0),
         EventFieldName.AUTHOR: dump.get("author"),
-        EventFieldName.CONTENT: dump.get("content"),
-        EventFieldName.ACTIONS: dump.get("actions"),
-        EventFieldName.BRANCH: dump.get("branch"),
+        EventFieldName.PAYLOAD: dump,
     }
 
 
 def event_from_inline_dict(d: dict[str, Any]) -> Event:
     from google.adk.events import Event
 
-    # ``_v`` is read for future dispatch; v0 (pre-tag) records and v1 share
-    # the same field set, so no branching needed today.
+    version = d.get(EventFieldName.SCHEMA_VERSION, 0)
+    payload = d.get(EventFieldName.PAYLOAD)
+    if version >= 2 and isinstance(payload, dict):
+        return Event.model_validate(payload)
+
+    # v0/v1 slim records — same field set, no branching beyond this path.
     return Event.model_validate(
         {
             "id": d.get(EventFieldName.EVENT_ID) or "",
