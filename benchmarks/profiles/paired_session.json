@@ -1,0 +1,14 @@
+{
+  "description": "Paired compare: multi-session agent loop at moderate fixed QPS.",
+  "workload": "session_hotpath",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 50,
+  "scheduler_thread_count": 2,
+  "worker_thread_count": 16,
+  "runtime_per_function": 30,
+  "workload_params": {
+    "session_count": 32,
+    "event_size_bytes": 400,
+    "recent_events": 20
+  }
+}

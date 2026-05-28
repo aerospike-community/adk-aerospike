@@ -15,7 +15,7 @@ registration so the `adk` CLI can use Aerospike directly:
 | --------------------- | -------------------------- | -------------------------------------------------------------- |
 | `BaseSessionService`  | `AerospikeSessionService`  | Aerospike KV + Map/List CDTs (chunked session records)         |
 | `BaseArtifactService` | `AerospikeArtifactService` | Aerospike KV (one record per version)                          |
-| `BaseMemoryService`   | `AerospikeMemoryService`   | Aerospike KV (server-side keyword search via list-element secondary index) |
+| `BaseMemoryService`   | `AerospikeMemoryService`   | Aerospike KV (lexical search via per-token posting-list PKs)              |
 
 ### Why use this
 
@@ -23,11 +23,12 @@ registration so the `adk` CLI can use Aerospike directly:
   and Memory, backed by a single Aerospike cluster.
 - **Native in-process client.** Talks directly to Aerospike; nothing extra
   to deploy or operate.
-- **Lexical memory search runs server-side in Aerospike** — text is
-  tokenized at write time and stored as a `keywords` list bin; queries use
-  Aerospike's list-element secondary index via
-  `predicates.contains(..., INDEX_TYPE_LIST)`. Same word-overlap semantics
-  as ADK's built-in `InMemoryMemoryService`, executed on the database.
+- **Lexical memory search in Aerospike** — text is tokenized at write time;
+  each query token does a point read on posting-list keys
+  (`app:user:kw:<token>`), then hydrates matching memory rows. Same
+  word-overlap semantics as ADK's `InMemoryMemoryService`.
+- **Session list via per-user manifest** — `app:user:sl` holds session ids;
+  list reads metadata bins only (no full event tail over the wire).
 - **Single-record server-side atomic appends** — Aerospike Map/List CDTs let
   `append_event` commit state delta, event append, and timestamp bump in one
   round trip.
@@ -263,8 +264,7 @@ asyncio.run(main())
 ## Example: MemoryService
 
 Lexical word-overlap search — same semantics as `InMemoryMemoryService`,
-executed server-side via Aerospike's list-element secondary index. No
-embedder.
+via per-token posting-list primary keys (`app:user:kw:<token>`). No embedder.
 
 ```python
 import asyncio
@@ -279,8 +279,7 @@ async def main() -> None:
     )
 
     # Persist a session's text events to long-term memory. Text is tokenized
-    # client-side into a list[str] of lowercase [A-Za-z]+ words and stored
-    # in a `keywords` bin indexed by Aerospike's list-element secondary index.
+    # into keywords; each token updates a posting-list row and a memory row.
     session = Session(
         id="s-1", app_name="support_bot", user_id="alice",
         events=[
@@ -296,9 +295,8 @@ async def main() -> None:
     )
     await memory.add_session_to_memory(session)
 
-    # Search — query is tokenized, then for each token Aerospike's
-    # list-element index returns matching records via predicates.contains.
-    # Client-side: union, scope-filter by (app, user), rank by token-overlap.
+    # Search — batch_read posting lists per query token, union refs,
+    # batch_read memory rows, rank by token overlap.
     resp = await memory.search_memory(
         app_name="support_bot", user_id="alice", query="python duck typing",
     )
@@ -337,6 +335,7 @@ Five sets in a single namespace (default prefix `adk_`):
 ```
 adk_sessions      app:user:session                ← session record (state + hot tail)
                   app:user:session:c:NNNNNNNN  ← sealed chunk record (older events)
+                  app:user:sl                    ← session-id manifest (list_sessions)
 
 adk_app_state     app                                   ← one per (app)
 adk_user_state    app:user                           ← one per (app, user)
@@ -344,9 +343,8 @@ adk_user_state    app:user                           ← one per (app, user)
 adk_artifacts     app:user:session:fname:NNNNNNNN
                   app:user:user:user:fname:NNNNNNNN   ← user-scoped (sentinel "user")
 
-adk_memory        app:user:session:eventid
-                  bins include keywords: list[str], indexed via list-element
-                  secondary index for server-side word-overlap search
+adk_memory        app:user:session:eventid       ← memory row
+                  app:user:kw:token              ← posting list ({eid,sid,ts} refs)
 ```
 
 The session record is the hot path — events accumulate in an inline List bin

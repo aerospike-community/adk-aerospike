@@ -21,10 +21,20 @@ WORKLOAD_TYPES: dict[str, Type[BaseBenchmarkWorkload]] = {
 }
 
 
-def build_workload(name: str, connection_string: str, params: dict[str, Any]) -> BaseBenchmarkWorkload:
+def build_workload(
+    name: str,
+    connection_string: str,
+    params: dict[str, Any],
+    *,
+    backend: str = "aerospike",
+) -> BaseBenchmarkWorkload:
     try:
         cls = WORKLOAD_TYPES[name]
     except KeyError as exc:
         known = ", ".join(sorted(WORKLOAD_TYPES))
         raise ValueError(f"unknown workload {name!r}; choose from: {known}") from exc
-    return cls(aerospike_connection_string=connection_string, **params)
+    if backend == "aerospike":
+        return cls(aerospike_connection_string=connection_string, **params)
+    if backend == "redis":
+        return cls(redis_connection_string=connection_string, **params)
+    raise ValueError(f"unknown backend {backend!r}; choose from: aerospike, redis")

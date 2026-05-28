@@ -596,12 +596,96 @@ async def test_partial_event_is_not_persisted(
     assert fetched.events == []
 
 
+async def test_manifest_tracks_create_and_delete(
+    session_service: AerospikeSessionService,
+) -> None:
+    from adk_aerospike._internal.schema import Bins
+
+    s = await session_service.create_session(
+        app_name="mfapp", user_id="u", session_id="mf-1"
+    )
+    pk = session_service._manifest_pk("mfapp", "u")
+    _, _, bins = session_service._client.get(pk)
+    assert "mf-1" in (bins.get(Bins.SESSION_MANIFEST) or [])
+
+    await session_service.delete_session(
+        app_name="mfapp", user_id="u", session_id=s.id
+    )
+    try:
+        _, _, bins = session_service._client.get(pk)
+        assert "mf-1" not in (bins.get(Bins.SESSION_MANIFEST) or [])
+    except Exception:
+        pass
+
+
+async def test_list_sessions_prunes_stale_manifest_ids(
+    session_service: AerospikeSessionService,
+) -> None:
+    from aerospike import exception as ae
+    from adk_aerospike._internal.schema import Bins
+
+    await session_service.create_session(
+        app_name="staleapp", user_id="u", session_id="gone-1"
+    )
+    session_pk = session_service._session_pk("staleapp", "u", "gone-1")
+    session_service._client.remove(session_pk)
+
+    resp = await session_service.list_sessions(app_name="staleapp", user_id="u")
+    assert resp.sessions == []
+
+    manifest_pk = session_service._manifest_pk("staleapp", "u")
+    try:
+        _, _, bins = session_service._client.get(manifest_pk)
+    except ae.RecordNotFound:
+        bins = {}
+    assert "gone-1" not in (bins.get(Bins.SESSION_MANIFEST) or [])
+
+
+async def test_list_sessions_uses_bin_projection(
+    session_service: AerospikeSessionService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from adk_aerospike.sessions import service as session_mod
+
+    captured: list[tuple[str, ...]] = []
+
+    async def _capture(
+        self: AerospikeSessionService,
+        keys: list[tuple[str, str, str]],
+        bins: tuple[str, ...],
+    ) -> dict[tuple[str, str, str], dict[str, object] | None]:
+        from adk_aerospike._internal.schema import Bins
+
+        captured.append(bins)
+        return {
+            k: {
+                Bins.APP_NAME: "projapp",
+                Bins.USER_ID: "u",
+                Bins.SESSION_ID: "p-1",
+                Bins.LAST_UPDATE: 0.0,
+            }
+            for k in keys
+        }
+
+    monkeypatch.setattr(
+        AerospikeSessionService,
+        "_batch_read_bins",
+        _capture,
+    )
+    await session_service.create_session(
+        app_name="projapp", user_id="u", session_id="p-1"
+    )
+    await session_service.list_sessions(app_name="projapp", user_id="u")
+    assert captured
+    assert captured[0] == session_mod._LIST_SESSION_BINS
+    assert "events" not in captured[0]
+    assert "state" not in captured[0]
+
+
 async def test_list_sessions_isolated_per_app(
     session_service: AerospikeSessionService,
 ) -> None:
-    """``list_sessions(app_name=X, user_id=Y)`` must not surface Y's sessions
-    from a different app — sec-index returns by user; the app filter is
-    applied in Python."""
+    """Each app has its own manifest key — sessions from appB never appear
+    under appA."""
     await session_service.create_session(
         app_name="appA", user_id="shared-user", session_id="ai-A"
     )
@@ -620,8 +704,7 @@ async def test_list_sessions_isolated_per_app(
 async def test_list_sessions_does_not_return_chunk_records(
     aerospike_uri: str,
 ) -> None:
-    """Chunks omit the app/uid/sid bins so they're invisible to the sec-index.
-    Force chunk creation and verify list_sessions still returns one row."""
+    """Chunks are not session rows; list_sessions (manifest path) returns one row."""
     from google.adk.events import Event, EventActions
     from google.genai import types as genai_types
 

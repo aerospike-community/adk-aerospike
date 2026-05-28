@@ -35,7 +35,7 @@ The third-party ADK storage integration landscape (as of 2026-05) is thin and un
 Our differentiators:
 1. Triple coverage in one package.
 2. **URI scheme registration** via `service_registry` — `adk web --session_db_url=aerospike://…` works (no competitor does this).
-3. **Lexical memory in core Aerospike** — text tokenized at write time into a `keywords` list bin; queries use the list-element secondary index (`predicates.contains` + `INDEX_TYPE_LIST`) for server-side word-overlap search. Same semantics as ADK's `InMemoryMemoryService`, executed in the database. No embedder, no HTTP sidecar.
+3. **Lexical memory in core Aerospike** — tokenized at write time; posting-list PKs (`app:user:kw:<token>`) point at memory rows. Same word-overlap semantics as `InMemoryMemoryService`. No embedder, no HTTP sidecar.
 4. Mirror in adk-java contrib/ later.
 
 ## Current status
@@ -50,7 +50,7 @@ Our differentiators:
 | `append_event` (single-record atomic, chunked tail/flush) | **Implemented + tested** | same |
 | `list_sessions` / `delete_session` (cascades all chunks + orphan) | **Implemented + tested** | same |
 | `AerospikeArtifactService.*` (incl. `list_artifact_versions`, `get_artifact_version`) | **Implemented + tested** | `src/adk_aerospike/artifacts/service.py` |
-| `AerospikeMemoryService.*` (lexical word-overlap; server-side via list-element index) | **Implemented + tested** | `src/adk_aerospike/memory/service.py` |
+| `AerospikeMemoryService.*` (lexical word-overlap; posting-list PK search) | **Implemented + tested** | `src/adk_aerospike/memory/service.py` |
 | `register()` (URI schemes) | Implemented | `src/adk_aerospike/registry.py` |
 | Tests | **41 passed, 0 skipped, 0 failed** | `tests/` |
 | Testcontainers Aerospike fixture | Working | `tests/conftest.py` |
@@ -63,7 +63,7 @@ Our differentiators:
 
 3. **Optional opt-in semantic memory** — if customers ask for paraphrase recall later, add a sibling `AerospikeSemanticMemoryService` that uses the Elasticsearch connector or a vendor MemoryBank. Don't fold it into the default service — keep `AerospikeMemoryService` honest as a storage-side keyword lookup.
 
-**Resolved this slice:** `append_event` atomicity (now single-record server-side atomic via the chunked tail design — MRT no longer needed for this op); memory algorithm (lexical word-overlap via list-element sec-index, no embedder).
+**Resolved this slice:** `append_event` atomicity (chunked tail, single-record `operate`); memory (posting-list lexical search); `list_sessions` (per-user manifest `app:user:sl` + bin-projected metadata reads).
 
 ## Layout & key conventions
 
@@ -84,7 +84,7 @@ src/adk_aerospike/
 ├── artifacts/{__init__,service}.py
 └── memory/
     ├── __init__.py
-    └── service.py       # Lexical word-overlap via list-element sec-index
+    └── service.py       # Lexical word-overlap via posting-list PKs
 ```
 
 Underscore conventions: `_internal/` = private subpackage, may change without major version bump. `registry.py` has no underscore because `register()` is real public surface.
@@ -166,7 +166,7 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 | `seq` counter on session + atomic increment via `operate` | `_storage_update_marker` optimistic-concurrency intent — stronger here (server-side single-record atomic) | `session.py:53` PrivateAttr |
 | `adk_artifacts` PK with `"user"` in the session slot for `user:*` filenames | `InMemoryArtifactService._artifact_path` user-namespace rule | `in_memory_artifact_service.py:56-91` |
 | `adk_memory` row per text-bearing event, scoped by `(app, uid)` | `InMemoryMemoryService._session_events[f"{app}/{user}"]` shape | `in_memory_memory_service.py` |
-| `keywords` list bin + list-element sec-index → server-side lexical match | `InMemoryMemoryService.search_memory` word-overlap matching, but executed in Aerospike via `predicates.contains(bin, INDEX_TYPE_LIST, token)` instead of in-process | Aerospike 3.8 release blog; "Query JSON Documents Faster with New CDT Indexing" |
+| Posting-list PKs `app:user:kw:token` + memory rows → lexical match | `InMemoryMemoryService.search_memory` word-overlap matching, executed via `batch_read` on posting lists then memory rows | Inverted-index pattern on KV |
 
 ### Where we matched exactly vs took an Aerospike-shaped liberty
 
@@ -183,7 +183,7 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 - ORM ordering by `timestamp` → explicit `seq:08d` zero-padded suffix (lexicographically sortable, secondary-indexable)
 - Row-update on state delta → single-RTT atomic `map_put_items` Map CDT
 - `_storage_update_marker` revision check → server-side atomic `operate(increment(seq) + read(seq))`
-- Client-side text matching → tokenized `keywords` list bin + list-element sec-index for server-side `predicates.contains` queries
+- Client-side text matching → posting-list PKs per query token + `batch_read` on memory rows
 
 ### Verify this hierarchy is current
 
@@ -219,13 +219,13 @@ Default set prefix `adk_`. Sets:
 - `adk_app_state` — key `app`, bin `state (Map)`
 - `adk_user_state` — key `app:user`, bin `state (Map)`
 - `adk_artifacts` — key `app:user:session:fname:ver:08d`, bins `app, uid, sid, aus, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`). `aus = "app:user:sid"` is the composite tenant index bin.
-- `adk_memory` — key `app:user:session:event_id`, bins `app, uid, sid, aus, eid, text, keywords (list[str]), author, ts, content (Map)`. Lexical word-overlap search runs server-side via Aerospike's list-element secondary index on `keywords`. `aus = "app:user:session"` narrows the purge query to one session.
+- `adk_memory` — memory row `app:user:session:event_id`; posting row `app:user:kw:token` (bin `mpl`). Search = `batch_read` posting lists per query token, then memory rows. `aus = "app:user:session"` narrows purge.
+- `adk_sessions` manifest — key `app:user:sl`, bin `sman` (session id list). `list_sessions(app, user)` uses manifest + bin-projected session reads.
 
 Indexes (auto-created by `_internal/indexes.py` on service init):
 - `idx_<prefix>sess_uid`, `idx_<prefix>sess_app` on `sessions`
 - `idx_<prefix>art_aus` (composite `app:user:scope`) and `idx_<prefix>art_fname` on `artifacts`
 - `idx_<prefix>mem_aus` (composite `app:user:session`, for purge) on `memory`
-- `idx_<prefix>mem_kw` on `memory.keywords` (list-element index, for search)
 
 The composite `aus` indexes on `artifacts` and `memory` are load-bearing for
 multi-tenant deployments — they let a tenant-scoped query (e.g. "list
@@ -300,7 +300,7 @@ The venv at `.venv/` already has everything installed (`pip install -e ".[dev]"`
 - **Not a fork of ADK** — we depend on `google-adk`.
 - **Not an MCP tool.** Pinecone/Couchbase/Qdrant/Mongo ship MCP tools; those are LLM-callable, not framework-invoked. We build real `BaseMemoryService`.
 - **No HTTP sidecar.** Rejected the `adk-redis` pattern.
-- **No vector search.** Aerospike does not have native vector search; we use core KV + list-element secondary indexes for lexical memory.
+- **No vector search.** Aerospike does not have native vector search; lexical memory uses posting-list PKs on core KV.
 - **Not on PyPI yet.** Local editable install only.
 - **Java port not started in this repo** — separate scaffold at `~/IdeaProjects/GoogleADK`.
 

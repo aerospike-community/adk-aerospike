@@ -11,6 +11,7 @@ Usage:
     python benchmarks/run.py --list-profiles
     python benchmarks/run.py --profile smoke
     python benchmarks/run.py --profile sustained --uri "aerospike://host:3000/ns?set_prefix=bench_"
+    python benchmarks/run.py --profile smoke --backend redis --uri "redis://127.0.0.1:6379/1"
 """
 
 from __future__ import annotations
@@ -81,6 +82,17 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--profile", help="JSON profile name under benchmarks/profiles/")
     p.add_argument("--uri", help="override profile connection_string")
+    p.add_argument(
+        "--backend",
+        choices=("aerospike", "redis"),
+        default="aerospike",
+        help="storage backend to benchmark (default: aerospike)",
+    )
+    p.add_argument(
+        "--results-dir",
+        type=Path,
+        help="write metrics transcript to <dir>/<profile>-<backend>.txt",
+    )
     p.add_argument("--list-profiles", action="store_true")
     p.add_argument("--list-workloads", action="store_true")
     args = p.parse_args()
@@ -103,6 +115,7 @@ def main() -> None:
         profile["workload"],
         uri,
         profile.get("workload_params", {}),
+        backend=args.backend,
     )
 
     runner = BenchmarkRunner(
@@ -122,12 +135,29 @@ def main() -> None:
         f"  qps={runner.queries_per_second}  runtime={runner.runtime_per_function}s  "
         f"schedulers={runner.scheduler_thread_count}  workers={runner.worker_thread_count}"
     )
-    tests = [t.__name__ for t in workload.get_aerospike_tests()]
-    print(f"  tests: {', '.join(tests)}")
+    if args.backend == "aerospike":
+        tests = [t.__name__ for t in workload.get_aerospike_tests()]
+    else:
+        tests = [t.__name__ for t in workload.get_redis_tests()]
+    print(f"  backend={args.backend}  tests: {', '.join(tests)}")
     print()
 
     runner.run()
-    runner.print_metrics()
+    if args.results_dir:
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+        out_path = args.results_dir / f"{args.profile}-{args.backend}.txt"
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_metrics()
+        transcript = buf.getvalue()
+        print(transcript, end="")
+        out_path.write_text(transcript)
+        print(f"Wrote metrics to {out_path}")
+    else:
+        runner.print_metrics()
 
 
 if __name__ == "__main__":
