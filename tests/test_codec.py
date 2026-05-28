@@ -104,13 +104,38 @@ def test_event_round_trip_multi_part_content():
     assert [p.text for p in back.content.parts] == ["first", "second"]
 
 
+def test_event_round_trip_preserves_extended_metadata():
+    """v2 payload must round-trip optional Event fields (upstream contract)."""
+    ev = Event(
+        invocation_id="invocation",
+        author="user",
+        content=genai_types.Content(role="user", parts=[genai_types.Part(text="x")]),
+        grounding_metadata=genai_types.GroundingMetadata(
+            web_search_queries=["query1"],
+        ),
+        long_running_tool_ids={"tool1"},
+        custom_metadata={"custom_key": "custom_value"},
+    )
+    back = event_from_inline_dict(event_to_inline_dict(ev))
+    assert back.invocation_id == "invocation"
+    assert back.grounding_metadata == ev.grounding_metadata
+    assert back.long_running_tool_ids == {"tool1"}
+    assert back.custom_metadata == {"custom_key": "custom_value"}
+
+
 def test_event_inline_dict_shape_is_stable():
-    """Schema-evolution guard: changing the on-record key names is a breaking
-    change for everyone with persisted data. If you change this list, you also
-    need a migration story (and a bump to EVENT_SCHEMA_VERSION)."""
+    """Schema-evolution guard: v2 on-record keys are ``_v``, ``eid``, ``ts``,
+    ``author``, and ``payload``. Legacy v1 field names remain in
+    :class:`EventFieldName` for reading old records only."""
     ev = _make_event()
     d = event_to_inline_dict(ev)
-    assert set(d.keys()) == {f.value for f in EventFieldName}
+    assert set(d.keys()) == {
+        EventFieldName.SCHEMA_VERSION.value,
+        EventFieldName.EVENT_ID.value,
+        EventFieldName.TIMESTAMP.value,
+        EventFieldName.AUTHOR.value,
+        EventFieldName.PAYLOAD.value,
+    }
 
 
 def test_event_schema_version_is_tagged():

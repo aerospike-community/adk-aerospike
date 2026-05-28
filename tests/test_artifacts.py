@@ -353,3 +353,159 @@ async def test_list_versions_returns_sorted(
         app_name="sortapp", user_id="u", session_id="ss", filename="series.txt"
     )
     assert out == [0, 1, 2, 3, 4]
+
+
+# ---- upstream adk-python contract tests (ported) ----------------------------
+
+
+async def test_load_empty_artifact(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_load_empty``."""
+    assert not await artifact_service.load_artifact(
+        app_name="test_app",
+        user_id="test_user",
+        session_id="session_id",
+        filename="filename",
+    )
+
+
+async def test_list_keys_preserves_user_prefix(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_list_keys_preserves_user_prefix``."""
+    part = genai_types.Part.from_bytes(data=b"test_data", mime_type="text/plain")
+    app_name = "upstream_art"
+    user_id = "user0"
+    session_id = "123"
+
+    for filename in ("user:document.pdf", "user:image.png", "session_file.txt"):
+        await artifact_service.save_artifact(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            filename=filename,
+            artifact=part,
+        )
+
+    artifact_keys = await artifact_service.list_artifact_keys(
+        app_name=app_name, user_id=user_id, session_id=session_id
+    )
+    assert sorted(artifact_keys) == sorted(
+        ["user:document.pdf", "user:image.png", "session_file.txt"]
+    )
+
+
+async def test_list_versions_with_slash_in_filename(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_list_versions``."""
+    app_name = "upstream_slash"
+    user_id = "user0"
+    session_id = "123"
+    filename = "with/slash/filename"
+    versions = [
+        genai_types.Part.from_bytes(
+            data=i.to_bytes(2, byteorder="big"), mime_type="text/plain"
+        )
+        for i in range(3)
+    ]
+    versions.append(genai_types.Part.from_text(text="hello"))
+
+    for part in versions:
+        await artifact_service.save_artifact(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            filename=filename,
+            artifact=part,
+        )
+
+    response_versions = await artifact_service.list_versions(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+        filename=filename,
+    )
+    assert response_versions == [0, 1, 2, 3]
+
+
+async def test_get_artifact_version_out_of_index(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_get_artifact_version_out_of_index``."""
+    part = genai_types.Part.from_bytes(data=b"test_data", mime_type="text/plain")
+    await artifact_service.save_artifact(
+        app_name="upstream_oob",
+        user_id="user0",
+        session_id="123",
+        filename="filename",
+        artifact=part,
+    )
+    assert not await artifact_service.get_artifact_version(
+        app_name="upstream_oob",
+        user_id="user0",
+        session_id="123",
+        filename="filename",
+        version=3,
+    )
+
+
+async def test_save_artifact_with_camel_case_dict(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_save_artifact_with_camel_case_dict``."""
+    raw_artifact = {
+        "inlineData": {
+            "mimeType": "image/png",
+            "data": "dGVzdF9pbWFnZV9kYXRh",
+        }
+    }
+    version = await artifact_service.save_artifact(
+        app_name="upstream_camel",
+        user_id="user0",
+        session_id="sess0",
+        filename="uploaded.png",
+        artifact=raw_artifact,
+    )
+    assert version == 0
+
+    loaded = await artifact_service.load_artifact(
+        app_name="upstream_camel",
+        user_id="user0",
+        session_id="sess0",
+        filename="uploaded.png",
+    )
+    assert loaded is not None
+    assert loaded.inline_data is not None
+    assert loaded.inline_data.mime_type == "image/png"
+
+
+async def test_save_artifact_with_snake_case_dict(
+    artifact_service: AerospikeArtifactService,
+) -> None:
+    """Ported from adk-python ``test_save_artifact_with_snake_case_dict``."""
+    raw_artifact = {
+        "inline_data": {
+            "mime_type": "text/plain",
+            "data": "aGVsbG8=",
+        }
+    }
+    version = await artifact_service.save_artifact(
+        app_name="upstream_snake",
+        user_id="user0",
+        session_id="sess0",
+        filename="uploaded.txt",
+        artifact=raw_artifact,
+    )
+    assert version == 0
+
+    loaded = await artifact_service.load_artifact(
+        app_name="upstream_snake",
+        user_id="user0",
+        session_id="sess0",
+        filename="uploaded.txt",
+    )
+    assert loaded is not None
+    # text/plain inline payloads normalise to a text Part on load.
+    assert loaded.text == "hello"

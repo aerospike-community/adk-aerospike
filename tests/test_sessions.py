@@ -963,3 +963,288 @@ async def test_append_event_updates_last_update_time(
     )
     assert fetched is not None
     assert fetched.last_update_time > created_ts
+
+
+# ---- upstream adk-python contract tests (ported) ----------------------------
+
+
+async def test_session_state_is_not_shared(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_session_state_is_not_shared``."""
+    from google.adk.events import Event, EventActions
+
+    app_name = "upstream_sess"
+    session1 = await session_service.create_session(
+        app_name=app_name, user_id="u1", session_id="s1", state={"sk1": "v1"}
+    )
+    await session_service.append_event(
+        session1,
+        Event(
+            invocation_id="inv1",
+            author="user",
+            actions=EventActions(state_delta={"sk2": "v2"}),
+        ),
+    )
+
+    session1_got = await session_service.get_session(
+        app_name=app_name, user_id="u1", session_id="s1"
+    )
+    assert session1_got is not None
+    assert session1_got.state.get("sk1") == "v1"
+    assert session1_got.state.get("sk2") == "v2"
+
+    session1b = await session_service.create_session(
+        app_name=app_name, user_id="u1", session_id="s1b"
+    )
+    assert session1b.state == {}
+
+
+async def test_temp_state_visible_across_sequential_events(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_temp_state_visible_across_sequential_events``."""
+    from google.adk.events import Event, EventActions
+
+    session = await session_service.create_session(
+        app_name="upstream_temp", user_id="u1", session_id="s_seq"
+    )
+    event1 = Event(
+        invocation_id="inv1",
+        author="agent1",
+        actions=EventActions(state_delta={"temp:output": "result_from_a1"}),
+    )
+    await session_service.append_event(session=session, event=event1)
+
+    assert session.state.get("temp:output") == "result_from_a1"
+    assert "temp:output" not in event1.actions.state_delta
+
+
+async def test_temp_state_not_persisted_in_event_delta(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_temp_state_is_not_persisted_in_state_or_events``."""
+    from google.adk.events import Event, EventActions
+
+    session = await session_service.create_session(
+        app_name="upstream_temp2", user_id="u1", session_id="s1"
+    )
+    event = Event(
+        invocation_id="inv1",
+        author="user",
+        actions=EventActions(state_delta={"temp:k1": "v1", "sk": "v2"}),
+    )
+    await session_service.append_event(session=session, event=event)
+
+    assert session.state.get("temp:k1") == "v1"
+    assert session.state.get("sk") == "v2"
+    assert "temp:k1" not in event.actions.state_delta
+    assert event.actions.state_delta.get("sk") == "v2"
+
+
+async def test_append_event_bytes(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_append_event_bytes``."""
+    from google.adk.events import Event
+    from google.genai import types
+
+    session = await session_service.create_session(
+        app_name="upstream_bytes", user_id="user"
+    )
+    test_content = types.Content(
+        role="user",
+        parts=[types.Part.from_bytes(data=b"test_image_data", mime_type="image/png")],
+    )
+    test_grounding_metadata = types.GroundingMetadata(
+        search_entry_point=types.SearchEntryPoint(sdk_blob=b"test_sdk_blob")
+    )
+    event = Event(
+        invocation_id="invocation",
+        author="user",
+        content=test_content,
+        grounding_metadata=test_grounding_metadata,
+    )
+    await session_service.append_event(session=session, event=event)
+
+    assert session.events[0].content == test_content
+
+    fetched = await session_service.get_session(
+        app_name="upstream_bytes", user_id="user", session_id=session.id
+    )
+    assert fetched is not None
+    assert len(fetched.events) == 1
+    assert fetched.events[0].content == test_content
+    assert fetched.events[0].grounding_metadata == test_grounding_metadata
+
+
+async def test_append_event_complete(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_append_event_complete``."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types
+
+    session = await session_service.create_session(
+        app_name="upstream_complete", user_id="user"
+    )
+    event = Event(
+        invocation_id="invocation",
+        author="user",
+        content=types.Content(role="user", parts=[types.Part(text="test_text")]),
+        turn_complete=True,
+        partial=False,
+        actions=EventActions(
+            artifact_delta={"file": 0},
+            transfer_to_agent="agent",
+            escalate=True,
+        ),
+        long_running_tool_ids={"tool1"},
+        error_code="error_code",
+        error_message="error_message",
+        interrupted=True,
+        grounding_metadata=types.GroundingMetadata(web_search_queries=["query1"]),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=1, candidates_token_count=1, total_token_count=2
+        ),
+        citation_metadata=types.CitationMetadata(),
+        custom_metadata={"custom_key": "custom_value"},
+        timestamp=1700000000.123,
+        input_transcription=types.Transcription(
+            text="input transcription",
+            finished=True,
+        ),
+        output_transcription=types.Transcription(
+            text="output transcription",
+            finished=True,
+        ),
+    )
+    await session_service.append_event(session=session, event=event)
+
+    fetched = await session_service.get_session(
+        app_name="upstream_complete", user_id="user", session_id=session.id
+    )
+    assert fetched == session
+
+
+async def test_list_sessions_all_users(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_list_sessions_all_users``.
+
+    ``list_sessions`` here returns metadata only (empty ``state`` / ``events``).
+    """
+    app_name = "upstream_list_all"
+    user_id_1 = "user1"
+    user_id_2 = "user2"
+
+    for session_id in ("session1a", "session1b"):
+        await session_service.create_session(
+            app_name=app_name,
+            user_id=user_id_1,
+            session_id=session_id,
+            state={"key": f"value{session_id}"},
+        )
+    await session_service.create_session(
+        app_name=app_name,
+        user_id=user_id_2,
+        session_id="session2a",
+        state={"key": "value2a"},
+    )
+
+    sessions_1 = (
+        await session_service.list_sessions(app_name=app_name, user_id=user_id_1)
+    ).sessions
+    assert len(sessions_1) == 2
+    assert {s.id for s in sessions_1} == {"session1a", "session1b"}
+
+    sessions_2 = (
+        await session_service.list_sessions(app_name=app_name, user_id=user_id_2)
+    ).sessions
+    assert len(sessions_2) == 1
+    assert sessions_2[0].id == "session2a"
+
+    sessions_all = (
+        await session_service.list_sessions(app_name=app_name, user_id=None)
+    ).sessions
+    assert len(sessions_all) == 3
+    assert {s.id for s in sessions_all} == {"session1a", "session1b", "session2a"}
+    for s in sessions_all:
+        assert s.state == {}
+        assert s.events == []
+
+
+async def test_create_and_list_sessions_returns_ids(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_create_and_list_sessions`` (metadata shape)."""
+    app_name = "upstream_list_ids"
+    user_id = "test_user"
+    session_ids = [f"session{i}" for i in range(5)]
+    for session_id in session_ids:
+        await session_service.create_session(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id,
+            state={"key": "value" + session_id},
+        )
+
+    sessions = (
+        await session_service.list_sessions(app_name=app_name, user_id=user_id)
+    ).sessions
+    assert len(sessions) == len(session_ids)
+    assert {s.id for s in sessions} == set(session_ids)
+
+
+async def test_get_session_with_combined_config(
+    session_service: AerospikeSessionService,
+) -> None:
+    """Ported from adk-python ``test_get_session_with_config`` (combined filters)."""
+    from google.adk.events import Event
+    from google.adk.sessions.base_session_service import GetSessionConfig
+
+    app_name = "upstream_cfg"
+    user_id = "user"
+    num_test_events = 5
+    session = await session_service.create_session(app_name=app_name, user_id=user_id)
+    for i in range(1, num_test_events + 1):
+        await session_service.append_event(session, Event(author="user", timestamp=i))
+
+    fetched = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session.id
+    )
+    assert fetched is not None
+    assert len(fetched.events) == num_test_events
+
+    config = GetSessionConfig(num_recent_events=3)
+    fetched = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session.id, config=config
+    )
+    assert fetched is not None
+    assert len(fetched.events) == 3
+    assert fetched.events[0].timestamp == num_test_events - 3 + 1
+
+    after_timestamp = 4.0
+    config = GetSessionConfig(after_timestamp=after_timestamp)
+    fetched = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session.id, config=config
+    )
+    assert fetched is not None
+    assert len(fetched.events) == num_test_events - int(after_timestamp) + 1
+    assert fetched.events[0].timestamp == after_timestamp
+
+    config = GetSessionConfig(after_timestamp=num_test_events * 10)
+    fetched = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session.id, config=config
+    )
+    assert fetched is not None
+    assert not fetched.events
+
+    config = GetSessionConfig(
+        after_timestamp=after_timestamp, num_recent_events=3
+    )
+    fetched = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session.id, config=config
+    )
+    assert fetched is not None
+    assert len(fetched.events) == num_test_events - int(after_timestamp) + 1

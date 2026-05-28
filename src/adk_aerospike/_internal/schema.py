@@ -39,7 +39,7 @@ Just below the 1 MiB write-block-size so even a huge event fits as a chunk by
 itself without bumping into the hard limit.
 """
 
-EVENT_SCHEMA_VERSION: Final = 1
+EVENT_SCHEMA_VERSION: Final = 2
 """On-record version tag for inline event Maps (``EventFieldName.SCHEMA_VERSION``).
 
 Bumped only when the field set changes in a way the reader must disambiguate.
@@ -112,6 +112,7 @@ class EventFieldName(StrEnum):
     CONTENT = "content"
     ACTIONS = "actions"
     BRANCH = "branch"
+    PAYLOAD = "payload"
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,6 +503,13 @@ EVENT_FIELD_REGISTRY: Final[dict[EventFieldName, EventFieldDefinition]] = {
         value_type="string",
         adk_field="Event.branch",
         notes="Optional",
+    ),
+    EventFieldName.PAYLOAD: EventFieldDefinition(
+        name=EventFieldName.PAYLOAD,
+        full_name="full event payload",
+        value_type="Map",
+        adk_field="Event (full model_dump)",
+        notes="v2+: complete JSON-compatible Event for lossless round-trip",
     ),
 }
 

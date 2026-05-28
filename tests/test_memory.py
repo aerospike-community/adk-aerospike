@@ -453,3 +453,317 @@ async def test_search_preserves_event_metadata(
     m = resp.memories[0]
     assert m.author == "model"
     assert m.content.parts[0].text == "reply about elephants"
+
+
+# ---- upstream adk-python contract tests (ported) ----------------------------
+
+_MOCK_APP_NAME = "test-app"
+_MOCK_USER_ID = "test-user"
+_MOCK_OTHER_USER_ID = "another-user"
+
+
+def _mock_session_1():
+    from google.adk.events import Event
+    from google.adk.sessions import Session
+    from google.genai import types as genai_types
+
+    return Session(
+        app_name=_MOCK_APP_NAME,
+        user_id=_MOCK_USER_ID,
+        id="session-1",
+        last_update_time=1000,
+        events=[
+            Event(
+                id="event-1a",
+                invocation_id="inv-1",
+                author="user",
+                timestamp=12345,
+                content=genai_types.Content(
+                    parts=[genai_types.Part(text="The ADK is a great toolkit.")]
+                ),
+            ),
+            Event(
+                id="event-1b",
+                invocation_id="inv-2",
+                author="user",
+                timestamp=12346,
+            ),
+            Event(
+                id="event-1c",
+                invocation_id="inv-3",
+                author="model",
+                timestamp=12347,
+                content=genai_types.Content(
+                    parts=[
+                        genai_types.Part(
+                            text="I agree. The Agent Development Kit (ADK) rocks!"
+                        )
+                    ]
+                ),
+            ),
+        ],
+    )
+
+
+def _mock_session_2():
+    from google.adk.events import Event
+    from google.adk.sessions import Session
+    from google.genai import types as genai_types
+
+    return Session(
+        app_name=_MOCK_APP_NAME,
+        user_id=_MOCK_USER_ID,
+        id="session-2",
+        last_update_time=2000,
+        events=[
+            Event(
+                id="event-2a",
+                invocation_id="inv-4",
+                author="user",
+                timestamp=54321,
+                content=genai_types.Content(
+                    parts=[genai_types.Part(text="I like to code in Python.")]
+                ),
+            ),
+        ],
+    )
+
+
+def _mock_session_different_user():
+    from google.adk.events import Event
+    from google.adk.sessions import Session
+    from google.genai import types as genai_types
+
+    return Session(
+        app_name=_MOCK_APP_NAME,
+        user_id=_MOCK_OTHER_USER_ID,
+        id="session-3",
+        last_update_time=3000,
+        events=[
+            Event(
+                id="event-3a",
+                invocation_id="inv-5",
+                author="user",
+                timestamp=60000,
+                content=genai_types.Content(parts=[genai_types.Part(text="This is a secret.")]),
+            ),
+        ],
+    )
+
+
+def _mock_session_with_no_events():
+    from google.adk.sessions import Session
+
+    return Session(
+        app_name=_MOCK_APP_NAME,
+        user_id=_MOCK_USER_ID,
+        id="session-4",
+        last_update_time=4000,
+    )
+
+
+async def test_add_session_to_memory_skips_empty_events(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_session_to_memory`` (behavioral)."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+
+    toolkit = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="toolkit ADK"
+    )
+    assert len(toolkit.memories) == 2
+    texts = {m.content.parts[0].text for m in toolkit.memories}
+    assert "The ADK is a great toolkit." in texts
+    assert "I agree. The Agent Development Kit (ADK) rocks!" in texts
+
+
+async def test_add_events_to_memory_with_explicit_events(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_events_to_memory_with_explicit_events``."""
+    session = _mock_session_1()
+    await memory_service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        session_id=session.id,
+        events=[session.events[0]],
+    )
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="toolkit"
+    )
+    assert len(result.memories) == 1
+    assert result.memories[0].content.parts[0].text == "The ADK is a great toolkit."
+
+
+async def test_add_events_to_memory_without_session_id(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_events_to_memory_without_session_id``."""
+    session = _mock_session_1()
+    await memory_service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        events=[session.events[0]],
+    )
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="toolkit"
+    )
+    assert len(result.memories) == 1
+    assert result.memories[0].content.parts[0].text == "The ADK is a great toolkit."
+
+
+async def test_add_events_to_memory_appends_without_replacing(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_events_to_memory_appends_without_replacing``."""
+    from google.adk.events import Event
+    from google.genai import types as genai_types
+
+    session = _mock_session_1()
+    await memory_service.add_session_to_memory(session)
+
+    new_event = Event(
+        id="event-1d",
+        invocation_id="inv-6",
+        author="user",
+        timestamp=12348,
+        content=genai_types.Content(parts=[genai_types.Part(text="A new fact.")]),
+    )
+    await memory_service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        session_id=session.id,
+        events=[new_event],
+    )
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="toolkit fact ADK"
+    )
+    texts = {m.content.parts[0].text for m in result.memories}
+    assert "The ADK is a great toolkit." in texts
+    assert "I agree. The Agent Development Kit (ADK) rocks!" in texts
+    assert "A new fact." in texts
+
+
+async def test_add_events_to_memory_deduplicates_event_ids(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_events_to_memory_deduplicates_event_ids``."""
+    from google.adk.events import Event
+    from google.genai import types as genai_types
+
+    session = _mock_session_1()
+    await memory_service.add_session_to_memory(session)
+
+    duplicate_event = Event(
+        id="event-1a",
+        invocation_id="inv-7",
+        author="user",
+        timestamp=12349,
+        content=genai_types.Content(
+            parts=[genai_types.Part(text="Updated duplicate text.")]
+        ),
+    )
+    await memory_service.add_events_to_memory(
+        app_name=session.app_name,
+        user_id=session.user_id,
+        session_id=session.id,
+        events=[duplicate_event],
+    )
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="toolkit duplicate ADK"
+    )
+    assert len(result.memories) == 2
+    assert all("Updated duplicate text." not in m.content.parts[0].text for m in result.memories)
+
+
+async def test_add_session_with_no_events_to_memory(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_add_session_with_no_events_to_memory``."""
+    await memory_service.add_session_to_memory(_mock_session_with_no_events())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="anything"
+    )
+    assert result.memories == []
+
+
+async def test_search_memory_simple_match(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_search_memory_simple_match``."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+    await memory_service.add_session_to_memory(_mock_session_2())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="Python"
+    )
+    assert len(result.memories) == 1
+    assert result.memories[0].content.parts[0].text == "I like to code in Python."
+    assert result.memories[0].author == "user"
+
+
+async def test_search_memory_case_insensitive_match(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_search_memory_case_insensitive_match``."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="development"
+    )
+    assert len(result.memories) == 1
+    assert (
+        result.memories[0].content.parts[0].text
+        == "I agree. The Agent Development Kit (ADK) rocks!"
+    )
+
+
+async def test_search_memory_multiple_matches(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_search_memory_multiple_matches``."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="How about ADK?"
+    )
+    assert len(result.memories) == 2
+    texts = {memory.content.parts[0].text for memory in result.memories}
+    assert "The ADK is a great toolkit." in texts
+    assert "I agree. The Agent Development Kit (ADK) rocks!" in texts
+
+
+async def test_search_memory_no_match_upstream(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_search_memory_no_match``."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="nonexistent"
+    )
+    assert not result.memories
+
+
+async def test_search_memory_is_scoped_by_user_upstream(
+    memory_service: AerospikeMemoryService,
+) -> None:
+    """Ported from adk-python ``test_search_memory_is_scoped_by_user``."""
+    await memory_service.add_session_to_memory(_mock_session_1())
+    await memory_service.add_session_to_memory(_mock_session_different_user())
+
+    result = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_USER_ID, query="secret"
+    )
+    assert not result.memories
+
+    result_other_user = await memory_service.search_memory(
+        app_name=_MOCK_APP_NAME, user_id=_MOCK_OTHER_USER_ID, query="secret"
+    )
+    assert len(result_other_user.memories) == 1
+    assert result_other_user.memories[0].content.parts[0].text == "This is a secret."
