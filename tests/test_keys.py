@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from adk_aerospike._internal.keys import (
     ARTIFACT_HEAD_SUFFIX,
+    MEMORY_KW_PREFIX,
     SEP,
     app_state_key,
     artifact_head_key,
     artifact_key,
     chunk_key,
+    memory_posting_key,
     session_key,
     user_state_key,
 )
@@ -52,6 +54,12 @@ def test_artifact_key_has_version_suffix():
     k = artifact_key("a", "u", "s", "file.png", 3)
     assert k.endswith(f"{SEP}00000003")
     assert "file.png" in k
+
+
+def test_memory_posting_key_format():
+    k = memory_posting_key("app", "user", "python")
+    assert f"{SEP}{MEMORY_KW_PREFIX}{SEP}" in k
+    assert k.endswith(f"{SEP}python")
 
 
 def test_artifact_head_key_distinct_from_versioned_key():

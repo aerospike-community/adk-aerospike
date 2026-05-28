@@ -1,0 +1,16 @@
+{
+  "description": "Paired compare: one composite turn (append + get_recent + memory search).",
+  "workload": "agent_turn",
+  "connection_string": "aerospike://127.0.0.1:3000/test?set_prefix=bench_",
+  "queries_per_second": 8,
+  "scheduler_thread_count": 1,
+  "worker_thread_count": 32,
+  "runtime_per_function": 15,
+  "workload_params": {
+    "session_count": 32,
+    "event_size_bytes": 400,
+    "recent_events": 20,
+    "query_tokens": 3,
+    "memory_corpus": 2000
+  }
+}

@@ -58,6 +58,7 @@ from .._internal.keys import (
     app_state_key,
     chunk_key,
     session_key,
+    session_manifest_key,
     user_state_key,
 )
 from .._internal.schema import (
@@ -66,6 +67,14 @@ from .._internal.schema import (
     Bins,
     Schema,
     StateScope,
+)
+
+# list_sessions metadata only — skip events/state (can be MiB per session).
+_LIST_SESSION_BINS: tuple[str, ...] = (
+    Bins.APP_NAME,
+    Bins.USER_ID,
+    Bins.SESSION_ID,
+    Bins.LAST_UPDATE,
 )
 from .._internal.uri import parse as parse_uri
 
@@ -159,6 +168,8 @@ class AerospikeSessionService(BaseSessionService):
                 user_delta,
             )
 
+        await self._manifest_add(app_name, user_id, session_id)
+
         merged = await self._merge_state_for_read(app_name, user_id, session_state)
         log.debug("Created session %s for app=%s user=%s", session_id, app_name, user_id)
         return Session(
@@ -222,23 +233,21 @@ class AerospikeSessionService(BaseSessionService):
         app_name: str,
         user_id: str | None = None,
     ) -> ListSessionsResponse:
-        from aerospike import predicates
         from google.adk.sessions.base_session_service import ListSessionsResponse
 
-        # Chunk records omit app/uid/sid bins, so the secondary index returns
-        # only session records — no chunk-filter step needed.
-        query = self._client.query(self._schema.namespace, self._schema.sessions_set)
         if user_id is not None:
-            query.where(predicates.equals(Bins.USER_ID, user_id))
-        else:
-            query.where(predicates.equals(Bins.APP_NAME, app_name))
+            return ListSessionsResponse(
+                sessions=await self._list_sessions_for_user(app_name, user_id)
+            )
 
+        from aerospike import predicates
+
+        query = self._client.query(self._schema.namespace, self._schema.sessions_set)
+        query.where(predicates.equals(Bins.APP_NAME, app_name))
         records = await asyncio.to_thread(query.results)
         sessions: list[Session] = []
         for _, _, bins in records:
             if bins.get(Bins.APP_NAME) != app_name:
-                continue
-            if user_id is not None and bins.get(Bins.USER_ID) != user_id:
                 continue
             sessions.append(
                 Session(
@@ -281,6 +290,8 @@ class AerospikeSessionService(BaseSessionService):
             await asyncio.to_thread(self._client.remove, session_pk)
         except ae.RecordNotFound:
             pass
+
+        await self._manifest_remove(app_name, user_id, session_id)
 
     async def append_event(self, session: Session, event: Event) -> Event:
         # Base class: apply temp state in-memory, trim temp from delta, append
@@ -346,6 +357,100 @@ class AerospikeSessionService(BaseSessionService):
             self._schema.sessions_set,
             chunk_key(app_name, user_id, session_id, cidx),
         )
+
+    def _manifest_pk(self, app_name: str, user_id: str) -> tuple[str, str, str]:
+        return (
+            self._schema.namespace,
+            self._schema.sessions_set,
+            session_manifest_key(app_name, user_id),
+        )
+
+    async def _manifest_add(
+        self, app_name: str, user_id: str, session_id: str
+    ) -> None:
+        from aerospike_helpers.operations import list_operations
+
+        await asyncio.to_thread(
+            self._client.operate,
+            self._manifest_pk(app_name, user_id),
+            [list_operations.list_append(Bins.SESSION_MANIFEST, session_id)],
+        )
+
+    async def _manifest_remove(
+        self, app_name: str, user_id: str, session_id: str
+    ) -> None:
+        import aerospike
+        from aerospike import exception as ae
+        from aerospike_helpers.operations import list_operations
+
+        try:
+            await asyncio.to_thread(
+                self._client.operate,
+                self._manifest_pk(app_name, user_id),
+                [
+                    list_operations.list_remove_by_value(
+                        Bins.SESSION_MANIFEST,
+                        session_id,
+                        aerospike.LIST_RETURN_NONE,
+                    )
+                ],
+            )
+        except ae.RecordNotFound:
+            pass
+
+    async def _list_sessions_for_user(
+        self, app_name: str, user_id: str
+    ) -> list[Session]:
+        from aerospike import exception as ae
+
+        try:
+            _, _, manifest_bins = await asyncio.to_thread(
+                self._client.get,
+                self._manifest_pk(app_name, user_id),
+            )
+        except ae.RecordNotFound:
+            return []
+
+        session_ids: list[str] = manifest_bins.get(Bins.SESSION_MANIFEST) or []
+        if not session_ids:
+            return []
+
+        session_pks = [
+            self._session_pk(app_name, user_id, sid) for sid in session_ids
+        ]
+        rows = await self._batch_read_bins(session_pks, _LIST_SESSION_BINS)
+        sessions: list[Session] = []
+        stale_ids: list[str] = []
+        for sid, pk in zip(session_ids, session_pks, strict=True):
+            bins = rows.get(pk)
+            if not bins:
+                stale_ids.append(sid)
+                continue
+            if bins.get(Bins.APP_NAME) != app_name:
+                stale_ids.append(sid)
+                continue
+            if bins.get(Bins.USER_ID) != user_id:
+                stale_ids.append(sid)
+                continue
+            sessions.append(
+                Session(
+                    id=bins.get(Bins.SESSION_ID, sid),
+                    app_name=app_name,
+                    user_id=user_id,
+                    state={},
+                    events=[],
+                    last_update_time=bins.get(Bins.LAST_UPDATE, 0.0),
+                )
+            )
+        if stale_ids:
+            await self._manifest_remove_stale(app_name, user_id, stale_ids)
+        return sessions
+
+    async def _manifest_remove_stale(
+        self, app_name: str, user_id: str, session_ids: list[str]
+    ) -> None:
+        for session_id in session_ids:
+            await self._manifest_remove(app_name, user_id, session_id)
 
     async def _append_to_tail(
         self,
@@ -604,6 +709,8 @@ class AerospikeSessionService(BaseSessionService):
         self, keys: list[tuple[str, str, str]]
     ) -> dict[tuple[str, str, str], dict[str, Any] | None]:
         """Fetch multiple records in one RTT; return bins-or-None per input key."""
+        if not keys:
+            return {}
         result = await asyncio.to_thread(self._client.batch_read, keys)
         # BatchRecord.result == 0 means OK; non-zero (typically 2) means
         # RecordNotFound. Match results back to inputs by digest order —
@@ -613,6 +720,29 @@ class AerospikeSessionService(BaseSessionService):
             if br.result == 0 and br.record is not None:
                 _, _, bins = br.record
                 out[input_key] = bins
+            else:
+                out[input_key] = None
+        return out
+
+    async def _batch_read_bins(
+        self,
+        keys: list[tuple[str, str, str]],
+        bins: tuple[str, ...],
+    ) -> dict[tuple[str, str, str], dict[str, Any] | None]:
+        """``batch_write`` with per-bin ``read`` ops — one RTT, no fat bins."""
+        if not keys:
+            return {}
+        from aerospike_helpers.batch.records import BatchRecords, Read
+        from aerospike_helpers.operations.operations import read as op_read
+
+        ops = [op_read(name) for name in bins]
+        batch = BatchRecords([Read(key, ops) for key in keys])
+        result = await asyncio.to_thread(self._client.batch_write, batch)
+        out: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+        for input_key, br in zip(keys, result.batch_records, strict=True):
+            if br.result == 0 and br.record is not None:
+                _, _, record_bins = br.record
+                out[input_key] = record_bins
             else:
                 out[input_key] = None
         return out

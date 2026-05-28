@@ -34,14 +34,14 @@ def ensure_session_indexes(client: aerospike.Client, schema: Schema) -> None:
 
     Note: the sessions set holds both session records and chunk records.
     Chunk records deliberately omit the ``app``/``uid``/``sid`` bins so they
-    don't appear in these indexes — ``list_sessions`` queries return session
-    records only, without a client-side filter step.
+    don't appear in these indexes. ``list_sessions(app, user)`` uses the
+    ``app:user:sl`` manifest (PK + bin-projected ``batch_write`` reads), not these indexes.
     """
     import aerospike
     from aerospike import exception as ae
 
     indexes = (
-        # (set, bin, type, index name)  — used by list_sessions(app, user)
+        # (set, bin, type, index name)  — used by list_sessions(app) without user_id
         (
             schema.sessions_set,
             BinName.USER_ID,
@@ -108,23 +108,13 @@ def ensure_artifact_indexes(client: aerospike.Client, schema: Schema) -> None:
 def ensure_memory_indexes(client: aerospike.Client, schema: Schema) -> None:
     """Create secondary indexes used by the MemoryService. Idempotent.
 
-    Two indexes:
-
-    - ``idx_<prefix>mem_kw`` — **list-element index** on the ``keywords`` bin.
-      Used by ``search_memory`` for the server-side keyword lookup via
-      ``predicates.contains(bin, INDEX_TYPE_LIST, token)``. This is the
-      canonical Aerospike pattern for tag/keyword search; see Aerospike 3.8
-      release notes and the "Query JSON Documents Faster with New CDT
-      Indexing" blog.
-    - ``idx_<prefix>mem_aus`` — scalar string index on the composite
-      ``app:user:session`` bin. Used by ``add_session_to_memory``'s purge
-      step to find prior memories for this exact session — narrower than a
-      ``uid``-only index, which scans all sessions for that user.
+    ``idx_<prefix>mem_aus`` — scalar index on ``aus`` (``app:user:session``).
+    Used only by the purge step in ``add_session_to_memory`` (cold path).
+    Search uses posting-list primary keys (``app:user:kw:token``), not SI.
     """
     import aerospike
     from aerospike import exception as ae
 
-    # Composite (app:user:session) scope index — for the purge query.
     try:
         client.index_single_value_create(
             schema.namespace,
@@ -136,19 +126,6 @@ def ensure_memory_indexes(client: aerospike.Client, schema: Schema) -> None:
         log.info("Created scalar index idx_%smem_aus", schema.set_prefix)
     except ae.IndexFoundError:
         log.debug("idx_%smem_aus already exists", schema.set_prefix)
-
-    # keywords list-element index — for keyword search
-    try:
-        client.index_list_create(
-            schema.namespace,
-            schema.memory_set,
-            BinName.KEYWORDS,
-            aerospike.INDEX_STRING,
-            f"idx_{schema.set_prefix}mem_kw",
-        )
-        log.info("Created list-element index idx_%smem_kw", schema.set_prefix)
-    except ae.IndexFoundError:
-        log.debug("idx_%smem_kw already exists", schema.set_prefix)
 
 
 def _index_kind(kind: str) -> int:

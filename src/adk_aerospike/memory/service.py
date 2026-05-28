@@ -7,22 +7,14 @@ text into lowercase ``[A-Za-z]+`` words, return memory entries whose word set
 intersects the query's. No embeddings, no embedder dependency, no AI/ML
 surface area.
 
-The lexical matching runs **server-side** via Aerospike's list-element
-secondary index — the canonical Aerospike pattern for keyword/tag search.
-On write, text is tokenized in Python and stored as a ``keywords: list[str]``
-bin. On search, the query is tokenized and each token fires an indexed
-``predicates.contains(keywords, INDEX_TYPE_LIST, token)`` query in parallel;
-results are unioned client-side, deduplicated, and ranked by token-overlap
-count.
+Search uses an **inverted index of primary keys**, not secondary indexes:
+each ``(app_name, user_id, token)`` is a row ``app:user:kw:<token>`` with a
+list of ``{eid, sid, ts}`` refs. A query is ``batch_read`` on those posting
+rows (one PK per query token), then ``batch_read`` on the matching memory
+rows. Load is partitioned per user, not global per token.
 
-References
-----------
-- Aerospike 3.8 release notes (feature debut): the list-element predicate is
-  the headline example.
-- "Query JSON Documents Faster With New CDT Indexing" (Aerospike blog).
-- discuss.aerospike.com "Full text research queries": Aerospike staff
-  recommend list-bin + secondary index for tag/keyword search; recommend the
-  Elasticsearch connector for true full-text needs.
+Purge (``add_session_to_memory`` replace semantics) still uses the ``aus``
+secondary index to find prior memory rows for a session — a cold path.
 """
 
 from __future__ import annotations
@@ -30,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Final, Self
 
 from google.adk.memory import BaseMemoryService
 from google.adk.memory.base_memory_service import SearchMemoryResponse
@@ -39,7 +31,7 @@ from google.adk.memory.memory_entry import MemoryEntry
 from .._internal.client import close_client, make_client
 from .._internal.codec import extract_event_text
 from .._internal.indexes import ensure_memory_indexes
-from .._internal.keys import memory_key, scope_tuple
+from .._internal.keys import memory_key, memory_posting_key, scope_tuple
 from .._internal.schema import Bins, Schema
 from .._internal.uri import parse as parse_uri
 
@@ -52,12 +44,49 @@ log = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"[A-Za-z]+")
 
+# Ref map keys inside each posting-list element (short wire names).
+_REF_EID: Final = "eid"
+_REF_SID: Final = "sid"
+_REF_TS: Final = "ts"
+
+# Cap posting-list growth per token; trim oldest entries (front of list).
+_MAX_POSTING_LIST_SIZE: Final = 2048
+# Cap union size before loading full memory rows for scoring.
+_MAX_SEARCH_CANDIDATES: Final = 512
+
+_STOPWORDS: Final = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "with",
+    }
+)
+
 
 class AerospikeMemoryService(BaseMemoryService):
     """Lexical long-term memory in core Aerospike.
 
-    Word-overlap matching (same as ``InMemoryMemoryService``) executed
-    server-side via Aerospike's list-element secondary index.
+    Word-overlap matching (same as ``InMemoryMemoryService``) via per-user
+    posting-list primary keys — no list-element secondary index on search.
     """
 
     def __init__(
@@ -91,8 +120,6 @@ class AerospikeMemoryService(BaseMemoryService):
     # ---- BaseMemoryService -----------------------------------------------------
 
     async def add_session_to_memory(self, session: Session) -> None:
-        # Replace prior memories for this session (matches InMemoryMemoryService
-        # semantics: re-adding the same session overwrites).
         await self._purge_session_memories(
             session.app_name, session.user_id, session.id
         )
@@ -121,42 +148,80 @@ class AerospikeMemoryService(BaseMemoryService):
         if not query_tokens:
             return SearchMemoryResponse(memories=[])
 
-        # Fan out one indexed contains-query per token. Aerospike's list-element
-        # index returns all records whose keywords list contains the token.
-        # Parallel via to_thread + gather.
-        per_token_results = await asyncio.gather(
-            *(
-                asyncio.to_thread(self._run_token_query, token)
-                for token in query_tokens
+        posting_pks = [
+            self._posting_pk(app_name, user_id, token) for token in query_tokens
+        ]
+        posting_rows = await self._batch_read(posting_pks)
+
+        candidates: dict[str, tuple[str, float]] = {}
+        for token, pk in zip(query_tokens, posting_pks, strict=True):
+            bins = posting_rows.get(pk)
+            if not bins:
+                continue
+            for ref in bins.get(Bins.MEM_POSTINGS) or []:
+                if not isinstance(ref, dict):
+                    continue
+                eid = ref.get(_REF_EID, "")
+                sid = ref.get(_REF_SID, "")
+                if not eid or not sid:
+                    continue
+                ts = float(ref.get(_REF_TS) or 0.0)
+                prev = candidates.get(eid)
+                if prev is None or ts > prev[1]:
+                    candidates[eid] = (sid, ts)
+                if len(candidates) >= _MAX_SEARCH_CANDIDATES:
+                    break
+            if len(candidates) >= _MAX_SEARCH_CANDIDATES:
+                break
+
+        if not candidates:
+            return SearchMemoryResponse(memories=[])
+
+        memory_pks = [
+            (
+                self._schema.namespace,
+                self._schema.memory_set,
+                memory_key(app_name, user_id, sid, eid),
             )
-        )
+            for eid, (sid, _ts) in candidates.items()
+        ]
+        memory_rows = await self._batch_read(memory_pks)
 
-        # Union, filter by scope, score by token-overlap count, tie-break by ts desc.
-        scored: dict[str, tuple[int, float, dict[str, Any]]] = {}
         query_token_set = set(query_tokens)
-        for token_results in per_token_results:
-            for bins in token_results:
-                if bins.get(Bins.APP_NAME) != app_name:
-                    continue
-                if bins.get(Bins.USER_ID) != user_id:
-                    continue
-                eid = bins.get(Bins.EVENT_ID, "")
-                if not eid or eid in scored:
-                    continue
-                overlap = len(
-                    set(bins.get(Bins.KEYWORDS) or []) & query_token_set
-                )
-                ts = float(bins.get(Bins.TIMESTAMP) or 0.0)
-                scored[eid] = (overlap, ts, bins)
+        scored: list[tuple[int, float, dict[str, Any]]] = []
+        for eid, (sid, ts) in candidates.items():
+            pk = (
+                self._schema.namespace,
+                self._schema.memory_set,
+                memory_key(app_name, user_id, sid, eid),
+            )
+            bins = memory_rows.get(pk)
+            if not bins:
+                continue
+            if bins.get(Bins.APP_NAME) != app_name:
+                continue
+            if bins.get(Bins.USER_ID) != user_id:
+                continue
+            overlap = len(set(bins.get(Bins.KEYWORDS) or []) & query_token_set)
+            if overlap == 0:
+                continue
+            scored.append((overlap, ts, bins))
 
-        ranked = sorted(
-            scored.values(), key=lambda t: (t[0], t[1]), reverse=True
-        )
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
         return SearchMemoryResponse(
-            memories=[_memory_entry_from_bins(b) for _, _, b in ranked[: self._top_k]]
+            memories=[_memory_entry_from_bins(b) for _, _, b in scored[: self._top_k]]
         )
 
     # ---- internals -------------------------------------------------------------
+
+    def _posting_pk(
+        self, app_name: str, user_id: str, token: str
+    ) -> tuple[str, str, str]:
+        return (
+            self._schema.namespace,
+            self._schema.memory_set,
+            memory_posting_key(app_name, user_id, token),
+        )
 
     async def _upsert_memory(
         self,
@@ -168,6 +233,7 @@ class AerospikeMemoryService(BaseMemoryService):
         text: str,
     ) -> None:
         keywords = _tokenize(text)
+        ts = float(event.timestamp or 0.0)
         bins = {
             Bins.APP_NAME: app_name,
             Bins.USER_ID: user_id,
@@ -177,7 +243,7 @@ class AerospikeMemoryService(BaseMemoryService):
             Bins.TEXT: text,
             Bins.KEYWORDS: keywords,
             Bins.AUTHOR: event.author,
-            Bins.TIMESTAMP: float(event.timestamp or 0.0),
+            Bins.TIMESTAMP: ts,
             Bins.CONTENT: event.content.model_dump(mode="json")
             if event.content
             else None,
@@ -189,29 +255,79 @@ class AerospikeMemoryService(BaseMemoryService):
         )
         await asyncio.to_thread(self._client.put, pk, bins)
 
-    def _run_token_query(self, token: str) -> list[dict[str, Any]]:
-        """Sync indexed query: all records whose ``keywords`` list contains ``token``.
+        ref = {_REF_EID: event.id, _REF_SID: session_id, _REF_TS: ts}
+        for token in keywords:
+            await self._append_posting_ref(app_name, user_id, token, ref)
 
-        Designed to be called via ``asyncio.to_thread`` so multiple tokens'
-        queries run in parallel.
-        """
+    async def _append_posting_ref(
+        self,
+        app_name: str,
+        user_id: str,
+        token: str,
+        ref: dict[str, Any],
+    ) -> None:
+        from aerospike_helpers.operations import list_operations, operations as ops_
+
+        pk = self._posting_pk(app_name, user_id, token)
+        ops: list[Any] = [
+            list_operations.list_append(Bins.MEM_POSTINGS, ref),
+            ops_.read(Bins.MEM_POSTINGS),
+        ]
+        _, _, result = await asyncio.to_thread(self._client.operate, pk, ops)
+        postings = result.get(Bins.MEM_POSTINGS) or []
+        if len(postings) <= _MAX_POSTING_LIST_SIZE:
+            return
+
         import aerospike
-        from aerospike import predicates
 
-        q = self._client.query(self._schema.namespace, self._schema.memory_set)
-        q.where(predicates.contains(Bins.KEYWORDS, aerospike.INDEX_TYPE_LIST, token))
-        records = q.results()
-        return [bins for _, _, bins in records]
+        trim_count = len(postings) - _MAX_POSTING_LIST_SIZE
+        await asyncio.to_thread(
+            self._client.operate,
+            pk,
+            [
+                list_operations.list_remove_by_index_range(
+                    Bins.MEM_POSTINGS,
+                    0,
+                    aerospike.LIST_RETURN_NONE,
+                    trim_count,
+                )
+            ],
+        )
+
+    async def _remove_posting_refs(
+        self,
+        app_name: str,
+        user_id: str,
+        keywords: list[str],
+        session_id: str,
+        event_id: str,
+        ts: float,
+    ) -> None:
+        import aerospike
+        from aerospike import exception as ae
+        from aerospike_helpers.operations import list_operations
+
+        ref = {_REF_EID: event_id, _REF_SID: session_id, _REF_TS: ts}
+        for token in keywords:
+            pk = self._posting_pk(app_name, user_id, token)
+            try:
+                await asyncio.to_thread(
+                    self._client.operate,
+                    pk,
+                    [
+                        list_operations.list_remove_by_value(
+                            Bins.MEM_POSTINGS,
+                            ref,
+                            aerospike.LIST_RETURN_NONE,
+                        )
+                    ],
+                )
+            except ae.RecordNotFound:
+                pass
 
     async def _purge_session_memories(
         self, app_name: str, user_id: str, session_id: str
     ) -> None:
-        """Delete all memory rows for one (app, user, session) tuple.
-
-        Uses the composite ``aus`` (app:user:session) sec-index so the query
-        returns only this session's memories — no scan over the user's other
-        sessions, no scan over other apps that happen to share user ids.
-        """
         from aerospike import exception as ae
         from aerospike import predicates
 
@@ -223,26 +339,50 @@ class AerospikeMemoryService(BaseMemoryService):
         )
         records = await asyncio.to_thread(query.results)
         for _, _, bins in records:
+            eid = bins.get(Bins.EVENT_ID, "")
+            keywords = list(bins.get(Bins.KEYWORDS) or [])
+            ts = float(bins.get(Bins.TIMESTAMP) or 0.0)
+            if keywords and eid:
+                await self._remove_posting_refs(
+                    app_name, user_id, keywords, session_id, eid, ts
+                )
             pk = (
                 self._schema.namespace,
                 self._schema.memory_set,
-                memory_key(app_name, user_id, session_id, bins[Bins.EVENT_ID]),
+                memory_key(app_name, user_id, session_id, eid),
             )
             try:
                 await asyncio.to_thread(self._client.remove, pk)
             except ae.RecordNotFound:
                 pass
 
+    async def _batch_read(
+        self, keys: list[tuple[str, str, str]]
+    ) -> dict[tuple[str, str, str], dict[str, Any] | None]:
+        if not keys:
+            return {}
+        result = await asyncio.to_thread(self._client.batch_read, keys)
+        out: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+        for key, br in zip(keys, result.batch_records, strict=True):
+            if br.result == 0 and br.record is not None:
+                _, _, bins = br.record
+                out[key] = bins
+            else:
+                out[key] = None
+        return out
+
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase ``[A-Za-z]+`` tokenization matching ``InMemoryMemoryService``.
-
-    Dedupes — the list-element secondary index only needs unique values per
-    record, and dedup keeps the per-record list size bounded.
-    """
+    """Lowercase ``[A-Za-z]+`` tokens; stopwords and dedupe excluded from index."""
     if not text:
         return []
-    return list({m.group(0).lower() for m in _WORD_RE.finditer(text)})
+    return list(
+        {
+            m.group(0).lower()
+            for m in _WORD_RE.finditer(text)
+            if m.group(0).lower() not in _STOPWORDS
+        }
+    )
 
 
 def _memory_entry_from_bins(bins: dict[str, Any]) -> MemoryEntry:

@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `benchmarks/workloads/_redis_backend.py` — `google-adk-extras` session/memory services and a Redis hash store for artifact benchmarks.
-- `redis_*` methods on ecosystem workloads (`session_hotpath`, `memory_lexical`, `artifacts`, `agent_turn`, `chunk_stress`) mirroring each `aerospike_*` op.
-- `build_workload(..., backend="aerospike"|"redis")` in `benchmarks/workloads/__init__.py`.
+- Per-user session manifest (`app:user:sl`) and bin-projected `list_sessions(app, user)` metadata reads.
+- Posting-list inverted index for lexical memory search (`app:user:kw:<token>` primary keys).
+- Data-model diagrams and updated `docs/data-model.md` (manifests, posting rows, artifact head records).
+- Ecosystem benchmarks: `--backend redis`, `--results-dir`, `paired_*` profiles, and `[benchmark]` extras (`google-adk-extras`, `redis`, `sqlalchemy`).
+- `benchmarks/workloads/_redis_backend.py` and `redis_*` methods on ecosystem workloads for cross-backend comparison via `google-adk-extras`.
+
+### Changed
+
+- `AerospikeMemoryService.search_memory` uses posting-list `batch_read` per query token (no list-element secondary index on `keywords`).
+- `AerospikeSessionService.list_sessions` with `user_id` reads the session manifest instead of scanning `idx_*_sess_uid`.
 
 ## [0.0.1] - 2026-05-27
 
