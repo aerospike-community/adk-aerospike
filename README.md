@@ -401,15 +401,16 @@ pytest
 
 | Integration | Maintainer | Sess | Art | Mem | Architecture |
 | --- | --- | :-: | :-: | :-: | --- |
-| **adk-aerospike** (this) | Aerospike | ✓ | ✓ | ✓ semantic | In-process, single backend |
+| **adk-aerospike** (this) | Aerospike | ✓ | ✓ | ✓ lexical | In-process, single backend |
 | adk-redis | Redis Inc. | ✓ | ✗ | ✓ | HTTP sidecar (Agent Memory Server) + RedisVL |
 | adk-python built-in | Google | ✓ | ✓ | ✓ | In-process / Vertex managed |
 | adk-extra-services | Community | ✓ Mongo/Redis | ✓ S3/Local/Azure | ✗ | In-process |
 | google-adk-extras | Community | ✓ SQL/Mongo/Redis | ✓ Local/S3/SQL | ✓ keyword-only | In-process |
 | Pinecone / Qdrant / Couchbase / Chroma | Vendors | ✗ | ✗ | ✗ (just tools) | MCP server |
 
-We're the only package shipping all three storage interfaces with
-embedding-based semantic memory, backed by a single in-process database.
+We're the only package shipping Session, Artifact, and Memory in one
+in-process Aerospike backend. Memory search is lexical word-overlap (same
+semantics as `InMemoryMemoryService`), not embedding-based.
 
 ## License
 
