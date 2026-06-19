@@ -9,8 +9,8 @@ from adk_aerospike._internal.keys import (
     app_state_key,
     artifact_head_key,
     artifact_key,
-    chunk_key,
     memory_posting_key,
+    segment_key,
     session_key,
     user_state_key,
 )
@@ -20,26 +20,26 @@ def test_session_key_format():
     assert session_key("app1", "user1", "sess1") == f"app1{SEP}user1{SEP}sess1"
 
 
-def test_chunk_key_zero_padded():
-    k = chunk_key("app1", "user1", "sess1", 7)
-    assert k.endswith(f"{SEP}c:00000007")
+def test_segment_key_zero_padded():
+    k = segment_key("app1", "user1", "sess1", 7)
+    assert k.endswith(f"{SEP}g:00000007")
 
 
-def test_chunk_key_sortable():
+def test_segment_key_sortable():
     # Lexicographic ordering of the zero-padded suffix must match numeric ordering.
-    keys = [chunk_key("a", "u", "s", i) for i in (1, 12, 3, 100)]
+    keys = [segment_key("a", "u", "s", i) for i in (1, 12, 3, 100)]
     assert sorted(keys) == [
-        chunk_key("a", "u", "s", 1),
-        chunk_key("a", "u", "s", 3),
-        chunk_key("a", "u", "s", 12),
-        chunk_key("a", "u", "s", 100),
+        segment_key("a", "u", "s", 1),
+        segment_key("a", "u", "s", 3),
+        segment_key("a", "u", "s", 12),
+        segment_key("a", "u", "s", 100),
     ]
 
 
-def test_chunk_key_distinct_from_session_key():
-    # Session keys have 3 SEP-delimited fields; chunk keys have 4 with the
-    # last field prefixed "c:" — no ambiguity.
-    assert session_key("a", "u", "s") != chunk_key("a", "u", "s", 0)
+def test_segment_key_distinct_from_session_key():
+    # Session keys have 3 SEP-delimited fields; segment keys have 4 with the
+    # last field prefixed "g:" — no ambiguity.
+    assert session_key("a", "u", "s") != segment_key("a", "u", "s", 0)
 
 
 def test_app_state_key():

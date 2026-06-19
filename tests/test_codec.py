@@ -1,8 +1,8 @@
 """Unit tests for the codec (Event <-> inline dict) and tokenizer.
 
 These run without an Aerospike server — they protect the on-record event shape
-that lives on every session record and chunk, so a regression here is a hot
-silent breaking change for everyone with persisted data.
+that lives in every session segment, so a regression here is a hot silent
+breaking change for everyone with persisted data.
 """
 
 from __future__ import annotations
@@ -12,9 +12,10 @@ from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 
 from adk_aerospike._internal.codec import (
-    estimate_event_size,
     event_from_inline_dict,
+    event_map_key,
     event_to_inline_dict,
+    event_ts_from_map_key,
     extract_event_text,
 )
 from adk_aerospike._internal.schema import (
@@ -214,11 +215,27 @@ def test_extract_event_text_returns_empty_for_no_content():
     assert extract_event_text(ev) == ""
 
 
-def test_estimate_event_size_is_positive_and_monotonic_in_payload():
-    small = event_to_inline_dict(_make_event(text="x"))
-    big = event_to_inline_dict(_make_event(text="x" * 1000))
-    assert estimate_event_size(small) > 0
-    assert estimate_event_size(big) > estimate_event_size(small)
+def test_event_map_key_is_pure_function_of_event():
+    # Same (id, timestamp) → same key (idempotent retries); different → different.
+    assert event_map_key("abc", 1.5) == event_map_key("abc", 1.5)
+    assert event_map_key("abc", 1.5) != event_map_key("abc", 1.6)
+    assert event_map_key("abc", 1.5) != event_map_key("abd", 1.5)
+
+
+def test_event_map_key_sorts_chronologically():
+    # Lexicographic order of the zero-padded micros prefix == time order.
+    keys = [event_map_key("e", t) for t in (3.0, 1.0, 2.5, 1.000001)]
+    assert sorted(keys) == [
+        event_map_key("e", 1.0),
+        event_map_key("e", 1.000001),
+        event_map_key("e", 2.5),
+        event_map_key("e", 3.0),
+    ]
+
+
+def test_event_ts_round_trips_through_map_key():
+    key = event_map_key("evt-1", 1_700_000_000.123456)
+    assert event_ts_from_map_key(key) == pytest.approx(1_700_000_000.123456, abs=1e-6)
 
 
 # ---- artifact_scope_id --------------------------------------------------------

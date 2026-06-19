@@ -66,23 +66,26 @@ def event_from_inline_dict(d: dict[str, Any]) -> Event:
     )
 
 
-def estimate_event_size(event_dict: dict[str, Any]) -> int:
-    """Cheap byte estimate for the tail-bytes counter.
+def event_map_key(event_id: str, timestamp: float) -> str:
+    """Stable, chronologically-sortable key for an event in a segment map.
 
-    Doesn't need to be exact — used only to decide when to flush.
-    ``str(d)`` overcounts by ~2× vs the actual MessagePack encoding Aerospike
-    uses on the wire (Python's ``repr`` of dicts includes extra quote chars,
-    brackets, and spaces).
+    ``"{ts_micros:020d}:{event_id}"`` — the zero-padded microsecond prefix
+    orders entries by time (so ``map_get_by_index_range`` yields chronological
+    last-N server-side), and the ``event_id`` suffix guarantees uniqueness when
+    two events share a microsecond.
 
-    The overcount is **deliberately uncorrected**: it gives the flush
-    threshold extra headroom under Aerospike's 1 MiB write-block-size,
-    keeping individual chunks well below the limit even when state Maps grow
-    or estimator error compounds. The practical effect is that chunks are
-    smaller than the byte-budget reading would suggest — which lowers
-    flush-stall tail latency at the cost of slightly more chunk records per
-    session. Acceptable tradeoff.
+    Crucially the key is a **pure function of the event**: a retried append
+    recomputes the identical key, so the ``map_put`` is idempotent (it
+    overwrites the same slot rather than creating a duplicate). 20 digits of
+    microseconds covers epoch timestamps well past year 9999.
     """
-    return len(str(event_dict))
+    return f"{int(timestamp * 1_000_000):020d}:{event_id}"
+
+
+def event_ts_from_map_key(key: str) -> float:
+    """Inverse of the timestamp prefix in :func:`event_map_key` (epoch seconds)."""
+    micros = int(key.split(":", 1)[0])
+    return micros / 1_000_000
 
 
 def extract_event_text(event: Event) -> str:

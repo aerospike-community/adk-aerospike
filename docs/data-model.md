@@ -11,7 +11,7 @@ the package uses these sets (default prefix `adk_`, configurable):
 
 | Set              | Primary key                                                                                                            | Purpose                                                         |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `adk_sessions`   | `app : user : session` (session), `app : user : session : c:NNNNNNNN` (chunk), or `app : user : sl` (session manifest) | Session rows, sealed event chunks, and per-user session-id list |
+| `adk_sessions`   | `app : user : session` (session), `app : user : session : g:NNNNNNNN` (segment), or `app : user : sl` (session manifest) | Session rows, append-only event segments, and per-user session-id list |
 | `adk_app_state`  | `app`                                                                                                                  | App-scoped state (`app:` prefixed keys)                         |
 | `adk_user_state` | `app : user`                                                                                                           | User-scoped state (`user:` prefixed keys)                       |
 | `adk_artifacts`  | `app : user : session : filename : version:08d`                                                                        | Versioned binary artifacts                                      |
@@ -38,7 +38,7 @@ match `keys.py`.
 flowchart TB
   subgraph ns["Operator-chosen namespace"]
     direction TB
-    S["adk_sessions<br/>sessions + chunks + manifests"]
+    S["adk_sessions<br/>sessions + segments + manifests"]
     AS["adk_app_state<br/>one row per app"]
     US["adk_user_state<br/>one row per app:user"]
     AR["adk_artifacts<br/>versioned blobs + head counters"]
@@ -62,7 +62,7 @@ flowchart TB
 
   subgraph store["Aerospike records"]
     SR["Session row<br/>adk_sessions · app:user:session"]
-    CR["Chunk rows<br/>adk_sessions · app:user:session:c:NNNNNNNN"]
+    CR["Segment rows<br/>adk_sessions · app:user:session:g:NNNNNNNN"]
     APR["App state row<br/>adk_app_state · app"]
     UPR["User state row<br/>adk_user_state · app:user"]
     MR["Memory rows<br/>adk_memory · app:user:session:eid"]
@@ -92,19 +92,19 @@ flowchart TB
       MK --> SMAN["sman → list[str] session ids"]
     end
 
-    subgraph session["Session row — mutable hot path"]
+    subgraph session["Session row — state + segment pointer"]
       SK["PK: app : user : session"]
-      SK --> SBINS["app, uid, sid<br/>state Map<br/>events List tail<br/>ts, seq, chunks, tbytes"]
+      SK --> SBINS["app, uid, sid<br/>state Map<br/>ts, cur"]
     end
 
-    subgraph chunk["Chunk row — immutable spill"]
-      CK["PK: app : user : session : c : NNNNNNNN"]
-      CK --> CBINS["cidx<br/>events List sealed<br/>ts_lo, ts_hi"]
+    subgraph segment["Segment row — append-only events"]
+      CK["PK: app : user : session : g : NNNNNNNN"]
+      CK --> CBINS["gidx<br/>events Map (K_ORDERED)"]
     end
   end
 
   manifest -->|"list_sessions → batch_read metadata only"| session
-  session -->|"flush when tbytes ≥ threshold"| chunk
+  session -->|"map_put into cur; bump on RecordTooBig"| segment
 ```
 
 
@@ -114,32 +114,30 @@ each `app:user:session` (`app`, `uid`, `sid`, `ts` only).
 
 `**list_sessions(app)`** (no user): secondary index on `app` → filter in Python.
 
-### 4. Event storage — chunks + hot tail
+### 4. Event storage — append-only segments
 
 ```mermaid
 flowchart LR
   subgraph timeline["Event order oldest → newest"]
-    C0["c:00000000<br/>sealed List"]
-    C1["c:00000001<br/>sealed List"]
-    TAIL["session row<br/>events tail"]
+    C0["g:00000000<br/>events Map"]
+    C1["g:00000001<br/>events Map"]
+    CUR["g:NNNNNNNN = cur<br/>append target"]
   end
-  C0 --> C1 --> TAIL
-
-  subgraph session_meta["On session row"]
-    SEQ["seq — total appends ever"]
-    CH["chunks — count of valid sealed chunks"]
-    TB["tbytes — tail size estimate"]
-  end
+  C0 --> C1 --> CUR
 ```
 
 
 
-**Read path:** `get_session` serves from tail when `num_recent_events` fits;
-otherwise walks `c:(chunks-1)…0`, optionally `list_get_by_index_range` per chunk.
+Each segment's `events` is a K_ORDERED Map keyed `"{ts_micros:020d}:{event_id}"`,
+so entries sort chronologically and the key is a pure function of the event
+(idempotent `map_put`).
 
-**Valid chunk rule:** `c:N` is readable only if `session.chunks > N`.
+**Read path:** `get_session` walks segments `cur…0` newest→oldest,
+`map_get_by_index_range(-N, N)` per segment for `num_recent_events`, or
+`map_get_by_key_range` from the `after_timestamp` cutoff. Stops once N events are
+collected.
 
-### 5. Inline event Map (inside `events` List)
+### 5. Inline event Map (inside the `events` segment Map)
 
 ```mermaid
 classDiagram
@@ -251,7 +249,7 @@ No index on `memory.keywords` — search uses posting-list primary keys only.
 adk_sessions
   app : user : sl                          manifest (sman)
   app : user : session                     session row
-  app : user : session : c : NNNNNNNN      chunk row
+  app : user : session : g : NNNNNNNN      segment row
 
 adk_app_state
   app                                      state Map
@@ -294,7 +292,7 @@ Default prefix `adk_` → full set name `{prefix}{suffix}`.
 
 | Suffix (`StorageSet`) | Full name         | Primary key                                                         | Purpose                                              |
 | --------------------- | ----------------- | ------------------------------------------------------------------- | ---------------------------------------------------- |
-| `sessions`            | sessions          | `app:user:session`, `app:user:session:c:NNNNNNNN`, or `app:user:sl` | Session rows, chunks, per-user session-id manifest   |
+| `sessions`            | sessions          | `app:user:session`, `app:user:session:g:NNNNNNNN`, or `app:user:sl` | Session rows, event segments, per-user session-id manifest   |
 | `app_state`           | application state | `app`                                                               | Shared `app:`‑prefixed state for all users of an app |
 | `user_state`          | user state        | `app:user`                                                          | Per-user `user:`‑prefixed state across sessions      |
 | `artifacts`           | artifacts         | `app:user:session:filename:version:08d`                             | Versioned binary artifacts                           |
@@ -310,15 +308,11 @@ Default prefix `adk_` → full set name `{prefix}{suffix}`.
 | `uid`      | `USER_ID`          | user identifier                  | string    | sessions, artifacts, memory     | session, artifact, memory              |
 | `sid`      | `SESSION_ID`       | session identifier               | string    | sessions, artifacts, memory     | session, artifact, memory              |
 | `aus`      | `SCOPE_TUPLE`      | application user scope composite | string    | artifacts, memory               | artifact, memory                       |
-| `seq`      | `EVENT_SEQ`        | event sequence counter           | int       | sessions                        | session                                |
 | `state`    | `STATE`            | state map                        | Map       | sessions, app_state, user_state | session, app_state_row, user_state_row |
 | `ts`       | `TIMESTAMP`        | timestamp                        | float     | sessions, memory                | session, memory                        |
-| `events`   | `EVENTS`           | events list                      | List      | sessions                        | session, chunk                         |
-| `chunks`   | `CHUNKS`           | sealed chunk count               | int       | sessions                        | session                                |
-| `tbytes`   | `TAIL_BYTES`       | tail byte estimate               | int       | sessions                        | session                                |
-| `cidx`     | `CHUNK_IDX`        | chunk index                      | int       | sessions                        | chunk                                  |
-| `ts_lo`    | `TS_LO`            | chunk first-event timestamp      | float     | sessions                        | chunk                                  |
-| `ts_hi`    | `TS_HI`            | chunk last-event timestamp       | float     | sessions                        | chunk                                  |
+| `events`   | `EVENTS`           | events map (K_ORDERED)           | Map       | sessions                        | segment                                |
+| `cur`      | `CUR_SEGMENT`      | current (append-target) segment  | int       | sessions                        | session                                |
+| `gidx`     | `SEGMENT_IDX`      | segment index                    | int       | sessions                        | segment                                |
 | `fname`    | `FILENAME`         | artifact filename                | string    | artifacts                       | artifact                               |
 | `ver`      | `VERSION`          | artifact version number          | int       | artifacts                       | artifact                               |
 | `mime`     | `MIME_TYPE`        | MIME type                        | string    | artifacts                       | artifact                               |
@@ -343,7 +337,7 @@ filenames. Sec-indexed so tenant-scoped queries (`list_artifact_keys`,
 `**sid` on artifacts:** session id, or `"user"` for user-scoped artifacts
 (same constraint as upstream `InMemoryArtifactService`).
 
-Chunk records **omit** `app`, `uid`, and `sid` so they are not confused with
+Segment records **omit** `app`, `uid`, and `sid` so they are not confused with
 session rows. `**list_sessions` does not use those indexes** when `user_id` is
 set (see below).
 
@@ -377,11 +371,8 @@ Not Aerospike bins — keys within each List element. Defined by
 | `uid`    | str   | denormalised                                                  |
 | `sid`    | str   | denormalised                                                  |
 | `state`  | Map   | session-scoped state; updated via Map CDT                     |
-| `events` | List  | hot tail of recent events (each item is a Map — see below)    |
-| `ts`     | float | last update time (epoch seconds)                              |
-| `seq`    | int   | monotonic counter — total events ever appended                |
-| `chunks` | int   | number of sealed chunk records (== next chunk index to write) |
-| `tbytes` | int   | estimated size of the tail; flush trigger                     |
+| `ts`     | float | last update time (epoch seconds); also derived from newest event |
+| `cur`    | int   | current (append-target) segment index; bumped on rollover     |
 
 
 ### `adk_artifacts`
@@ -442,18 +433,18 @@ Sibling record per `(app, user, session, filename)` holding the next version
 number. `save_artifact` uses atomic `increment(ver)` on this key — not a stored
 artifact version row. See `keys.artifact_head_key`.
 
-### `adk_sessions` — chunk record (key suffix `: c:NNNNNNNN`)
+### `adk_sessions` — segment record (key suffix `: g:NNNNNNNN`)
 
 
-| Bin      | Type  | Notes                                                              |
-| -------- | ----- | ------------------------------------------------------------------ |
-| `cidx`   | int   | chunk index — also serves as discriminator (session has no `cidx`) |
-| `events` | List  | sealed (immutable) batch of events                                 |
-| `ts_lo`  | float | timestamp of first event in chunk — `after_timestamp` pruning      |
-| `ts_hi`  | float | timestamp of last event in chunk                                   |
+| Bin      | Type            | Notes                                                              |
+| -------- | --------------- | ------------------------------------------------------------------ |
+| `gidx`   | int             | segment index — also serves as discriminator (session has no `gidx`) |
+| `events` | Map (K_ORDERED) | append-only event map keyed `"{ts_micros:020d}:{event_id}"` → inline event dict |
 
 
-Chunks deliberately **omit `app`/`uid`/`sid` bins** so they are never listed as
+A segment's min/max event timestamps are the first/last keys of the ordered
+`events` map (`map_get_by_index 0` / `-1`), not separate bins. Segments
+deliberately **omit `app`/`uid`/`sid` bins** so they are never listed as
 sessions.
 
 ### `adk_sessions` — session manifest (key suffix `:sl`)
@@ -489,28 +480,33 @@ filters in Python (cold path).
 | `branch`  | str   | optional branch label                        |
 
 
-## Chunking & flush triggers
+## Segment rollover (react, don't predict)
 
-- **Default flush threshold:** 256 KiB (¼ of Aerospike `write-block-size`).
-When `tbytes >= 256 KiB` after an append, the tail is flushed to a chunk
-record at `c:chunks`, the tail is cleared, and `chunks` is incremented.
-- **Huge single event:** if an individual event exceeds 900 KiB, it is
-pre-flushed (current tail sealed first) and then placed in its own fresh
-tail so it doesn't combine with other events into an over-large record.
-- **Both thresholds configurable** via `AerospikeSessionService(..., flush_threshold_bytes=..., huge_event_bytes=...)`.
+- **No client-side estimation.** There is no byte counter, no flush threshold,
+no size-gate. Appends `map_put` into the current segment (`cur`); the only
+overflow signal is Aerospike's own `RecordTooBig`.
+- **Rollover on overflow.** A `RecordTooBig` against a non-empty segment means
+it is full → bump `cur` with a `cur == N` guarded `increment` (so concurrent
+rollovers converge on the same next index) and retry the `map_put` on the new
+segment. Segments thus pack to ~`max-record-size` naturally.
+- **Oversized single event.** A `RecordTooBig` against a freshly-created empty
+segment means the lone event exceeds `max-record-size` — raised to the caller
+(object-store spill is future work).
 
 ## Atomicity & crash safety
 
-Fast-path append is a **single server-side atomic `operate()`** on the session
-record (`list_append + increment(seq) + increment(tbytes) + map_put_items(state) + write(ts)`).
+A no-state-delta append is a **single atomic `operate()`** (`map_put`) on the
+current segment record. An append carrying state is one **`batch_write`**
+coalescing the segment `map_put` with the session/app/user `state` writes — one
+round trip, results reported per record (so a segment `RecordTooBig` surfaces
+while the sibling state writes still commit; rollover then re-puts the event).
 No MRT required.
 
-Flush is two ops: PUT the chunk record (overwriting any orphan from a prior
-interrupted flush), then a generation-checked `operate()` to clear the tail
-and bump `chunks`. **Invariant:** chunk record `c:N` is *valid* only when
-`session.chunks > N`. Any chunk at `cidx >= session.chunks` is an orphan that
-readers ignore and that the next successful flush overwrites — no data loss
-because the tail still holds the events until the gen-checked reset commits.
+Idempotency makes crash/retry safe: the segment-map key is a pure function of
+`(event.id, event.timestamp)`, so a re-append overwrites the same slot and never
+duplicates. A crash after a `cur` bump but before the new segment is written is
+fine — the next `map_put` creates it, and readers treat a missing top segment as
+empty. There is no seal step, so no orphan/"valid iff" invariant to maintain.
 
 ## Secondary indexes
 
@@ -588,13 +584,9 @@ store an S3/GCS reference instead of inline bytes (planned, not v0.0.1).
 
 ## Strong consistency vs AP
 
-Works in both. Because events live inline on the session record (chunked when
-large), `append_event` is a single-record atomic `operate()` regardless of
-namespace consistency mode — no MRT required for the hot path. Flush is
-two ops with optimistic gen-check; the invariant above makes it crash-safe in
-either mode.
-
-App/user state updates are independent single-record operates on their own
-records; they are not atomic with the session-record append, but ADK's
-contract permits this (DatabaseSessionService doesn't make that guarantee
-either).
+Works in both. A no-state-delta `append_event` is a single-record atomic
+`operate()` (`map_put`) on a segment regardless of namespace consistency mode —
+no MRT required. An append carrying state is one `batch_write`; its records are
+applied independently (not cross-record atomic), but ADK's contract permits this
+(DatabaseSessionService doesn't make that guarantee either). Idempotent
+`map_put` keying makes the hot path crash- and retry-safe in either mode.

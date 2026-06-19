@@ -14,8 +14,8 @@ Format choices
   not by splitting on ``:`` — but Aerospike itself hashes the whole string to
   a digest, so this only matters for human inspection of keys.
 - Session record:  ``app : user : session``
-- Chunk record:    ``app : user : session : c:NNNNNNNN``  (chunk-index
-  suffix uses ``c:`` to keep it visually distinct from a session id)
+- Segment record:  ``app : user : session : g:NNNNNNNN``  (segment-index
+  suffix uses ``g:`` to keep it visually distinct from a session id)
 - App-state:       ``app``
 - User-state:      ``app : user``
 - Artifact:        ``app : user : session : filename : NNNNNNNN``
@@ -44,12 +44,12 @@ MEMORY_KW_PREFIX: Final = "kw"
 SESSION_MANIFEST_SUFFIX: Final = "sl"
 """Suffix for per-user session-id manifest: ``app:user:sl`` (not a session row)."""
 
-CHUNK_KEY_PREFIX: Final = "c:"
-"""Prefix on the chunk-id suffix of chunk record keys, e.g. ``c:00000003``.
+SEGMENT_KEY_PREFIX: Final = "g:"
+"""Prefix on the segment-id suffix of segment record keys, e.g. ``g:00000003``.
 
-Distinguishes a chunk record from a session record sharing the (app, user,
-session) triple. Session keys have three SEP-delimited fields; chunk keys
-have four, and the fourth always begins with ``c:``.
+Distinguishes a segment record from a session record sharing the (app, user,
+session) triple. Session keys have three SEP-delimited fields; segment keys
+have four, and the fourth always begins with ``g:``.
 """
 
 
@@ -57,12 +57,12 @@ def session_key(app_name: str, user_id: str, session_id: str) -> str:
     return f"{app_name}{SEP}{user_id}{SEP}{session_id}"
 
 
-def chunk_key(
-    app_name: str, user_id: str, session_id: str, chunk_idx: int
+def segment_key(
+    app_name: str, user_id: str, session_id: str, segment_idx: int
 ) -> str:
     return (
         f"{app_name}{SEP}{user_id}{SEP}{session_id}"
-        f"{SEP}{CHUNK_KEY_PREFIX}{chunk_idx:08d}"
+        f"{SEP}{SEGMENT_KEY_PREFIX}{segment_idx:08d}"
     )
 
 

@@ -1,13 +1,14 @@
 # Atomic Session Append with ADK and Aerospike
 
-When an AI agent emits a new event, you must update the event list, merge a
-state delta, bump a sequence counter, and refresh the timestamp — ideally in one
-atomic step, without race conditions or multiple round trips.
+When an AI agent emits a new event, you must persist the event and merge a
+state delta — ideally in one atomic step, without race conditions, lost writes,
+or multiple round trips.
 
-This tutorial shows how `AerospikeSessionService.append_event` uses Aerospike
-**List and Map Complex Data Types (CDTs)** in a single server-side `operate()`
-call. You will connect to Aerospike, append an event with a multi-scope state
-delta, read back the merged session, and verify concurrent appends.
+This tutorial shows how `AerospikeSessionService.append_event` stores events in
+an append-only **K_ORDERED Map** segment record and coalesces any state delta
+into a single round trip. You will connect to Aerospike, append an event with a
+multi-scope state delta, read back the merged session, and verify that
+concurrent appends never lose or duplicate data even as segments roll over.
 
 This tutorial requires:
 
@@ -21,10 +22,10 @@ This tutorial requires:
 
 This tutorial covers:
 
-- How session-scoped updates map to one atomic `operate()` per append
-- Which CDT operations run on the session record (`list_append`, `map_put_items`,
-  `increment`, `write`)
-- How app- and user-scoped state deltas route to separate records
+- How events are stored in append-only segment records as a K_ORDERED Map
+- How an append carrying state coalesces the event + state writes into one
+  `batch_write` (one round trip)
+- How a real `RecordTooBig` drives segment rollover (no client-side estimation)
 - Verifying correctness under concurrent `append_event` load
 
 ## Start Aerospike Database
@@ -98,9 +99,10 @@ Connected to Aerospike.
 
 ## Connect with production defaults
 
-For real workloads, connect with `from_uri`. Session-scoped persistence on each
-`append_event` is one atomic `operate()` on the session record — no
-multi-record transaction on the hot path.
+For real workloads, connect with `from_uri`. Each `append_event` is one round
+trip — a single `operate()` on the current segment when there is no state delta,
+or one `batch_write` coalescing the event with the state writes when there is —
+with no multi-record transaction on the hot path.
 
 ```python
 from adk_aerospike import AerospikeSessionService
@@ -119,35 +121,44 @@ Connected to Aerospike.
 
 Modify the host, port, or namespace in the URI if your cluster differs.
 
-## Understand the session record layout
+## Understand the session + segment layout
 
 A session row lives in set `adk_sessions` with primary key
-`app_name:user_id:session_id`. The hot-path append updates these bins on that
-single record:
+`app_name:user_id:session_id`. It is small and holds only scoped state plus a
+pointer to the current segment:
 
-| Bin | CDT type | Updated on append |
-|-----|----------|-------------------|
-| `events` | List | `list_append` — inline event Map |
-| `state` | Map | `map_put_items` — session-scoped delta (optional) |
-| `seq` | integer | `increment` — monotonic append counter |
-| `tbytes` | integer | `increment` — tail size estimator |
-| `ts` | float | `write` — `last_update_time` |
+| Bin | CDT type | Meaning |
+|-----|----------|---------|
+| `state` | Map | session-scoped state (`map_put_items` on a state delta) |
+| `cur` | integer | current append-target segment index (bumped on rollover) |
+| `ts` | float | `last_update_time` |
 
-App-scoped keys (`app:…`) and user-scoped keys (`user:…`) in `state_delta`
-route to separate `adk_app_state` / `adk_user_state` rows, each with their own
-atomic `map_put_items` — still one RTT per scope, not bundled into the session
-`operate()`.
+Events live in **segment records** keyed `app_name:user_id:session_id:g:NNNNNNNN`,
+each a single `events` bin holding a **K_ORDERED Map**:
+
+| Bin | CDT type | Meaning |
+|-----|----------|---------|
+| `events` | Map (K_ORDERED) | `"{ts_micros:020d}:{event_id}"` → inline event Map |
+| `gidx` | integer | segment index (segments omit `app/uid/sid`, so `list_sessions` ignores them) |
+
+The map key is a pure function of the event, so a `map_put` is **idempotent** —
+a retried append overwrites the same slot and can never duplicate. The key also
+sorts chronologically, so `get_session` reads the last N events server-side.
 
 When you call `append_event`, session-scoped, app-scoped, and user-scoped keys
-in `state_delta` are partitioned automatically. `get_session` batch-reads the
+in `state_delta` are partitioned automatically and, together with the event
+`map_put`, coalesced into a single `batch_write`. `get_session` batch-reads the
 session row plus app/user state and merges prefixed keys for the ADK caller.
 
 ## Complete example
 
 The script below walks through more of the append path in one run: several
-sequential `append_event` calls with scoped `state_delta`, a `get_session` read
-after each phase, a direct bin read (`seq`, `tbytes`, tail length), then 64
-concurrent appends to the same session.
+sequential `append_event` calls with scoped `state_delta`, a read-back of the
+merged session, then **32 concurrent writers** that each issue **500** appends
+to the same session (16,000 appends total) — spanning many segment rollovers
+with no loss or duplication. (Scale the writer count to your cluster's write
+throughput; a single under-provisioned node can return `DeviceOverload` under
+heavy concurrent load.)
 
 Save as `atomic_session_append_demo.py` and run with
 `python atomic_session_append_demo.py`.
@@ -163,15 +174,16 @@ from google.genai import types as genai_types
 from adk_aerospike import AerospikeSessionService
 
 APP, USER, SID = "demo-app", "user-1", "session-1"
+WRITERS = 32
+WRITES_PER_WRITER = 500
 
 
-def print_bins(client: aerospike.Client, label: str) -> None:
+def print_session_record(client: aerospike.Client, label: str) -> None:
     pk = ("test", "adk_sessions", f"{APP}:{USER}:{SID}")
-    _, _, bins = client.select(pk, ["events", "seq", "tbytes", "state"])
-    tail = bins.get("events") or []
+    _, _, bins = client.select(pk, ["cur", "state"])
     print(
-        f"{label} — tail_len={len(tail)}, seq={bins.get('seq')}, "
-        f"tbytes={bins.get('tbytes')}, session_state_keys={len(bins.get('state') or {})}"
+        f"{label} — cur_segment={bins.get('cur')}, "
+        f"session_state_keys={len(bins.get('state') or {})}"
     )
 
 
@@ -211,36 +223,42 @@ async def main() -> None:
             f"state={snap.state}"
         )
 
-    print_bins(client, "after 5 sequential appends")
+    print_session_record(client, "after 5 sequential appends")
 
-    # --- concurrent appends: 64 writers, one session ---
-    async def one(i: int) -> None:
-        await session_service.append_event(
-            session,
-            Event(
-                invocation_id=f"par-{i:04d}",
-                author="tool",
-                timestamp=time.time(),
-                content=genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part(text=f"tool output {i:04d}")],
+    # --- concurrent load: 64 writers × 1000 appends each ---
+    async def writer(writer_id: int) -> None:
+        for i in range(WRITES_PER_WRITER):
+            await session_service.append_event(
+                session,
+                Event(
+                    invocation_id=f"w{writer_id:02d}-{i:04d}",
+                    author=f"worker-{writer_id}",
+                    timestamp=time.time(),
+                    content=genai_types.Content(
+                        role="user",
+                        parts=[
+                            genai_types.Part(
+                                text=f"worker {writer_id} write {i}"
+                            )
+                        ],
+                    ),
                 ),
-                actions=EventActions(state_delta={f"tool:{i:04d}": i}),
-            ),
-        )
+            )
+            session.events.clear()
 
     started = time.perf_counter()
-    await asyncio.gather(*(one(i) for i in range(64)))
+    await asyncio.gather(*(writer(w) for w in range(WRITERS)))
     elapsed = time.perf_counter() - started
 
+    expected = 5 + WRITERS * WRITES_PER_WRITER
     final = await session_service.get_session(
         app_name=APP, user_id=USER, session_id=SID
     )
     print(
-        f"\n64 parallel appends in {elapsed:.2f}s — "
-        f"total events={len(final.events)}, state_keys={len(final.state)}"
+        f"\n{WRITERS} writers × {WRITES_PER_WRITER} appends in {elapsed:.1f}s — "
+        f"stored {len(final.events)} events (expected {expected})"
     )
-    print_bins(client, "after concurrent appends")
+    print_session_record(client, "after concurrent appends")
 
     await session_service.delete_session(app_name=APP, user_id=USER, session_id=SID)
     session_service.close()
@@ -258,22 +276,30 @@ after append 0: events=1, state={'app:tenant': 'acme', 'turn': 0, 'user:locale':
 after append 1: events=2, state={'app:tenant': 'acme', 'turn': 1, 'user:locale': 'en-US'}
 ...
 after append 4: events=5, state={'app:tenant': 'acme', 'turn': 4, 'user:locale': 'en-US'}
-after 5 sequential appends — tail_len=5, seq=5, tbytes=9160, session_state_keys=1
+after 5 sequential appends — cur_segment=0, session_state_keys=1
 
-64 parallel appends in 0.02s — total events=69, state_keys=67
-after concurrent appends — tail_len=69, seq=69, tbytes=123224, session_state_keys=65
+32 writers × 500 appends in 3.1s — stored 16005 events (expected 16005)
+after concurrent appends — cur_segment=15, session_state_keys=1
 Connection closed.
 ```
 
-Each `append_event` issues one atomic `operate()` on the session record
-(`list_append`, optional `map_put_items`, `increment` on `seq`/`tbytes`, `write`
-on `ts`). Concurrent calls serialize on the partition master — no lost events or
-sequence gaps.
+Each `append_event` does a single `map_put` of the event into the current
+segment, keyed `"{ts_micros:020d}:{event_id}"`. Because that key is a pure
+function of the event, the write is **idempotent** — a retried or duplicated
+append overwrites the same slot and never produces a duplicate. When a segment
+fills, the `map_put` returns `RecordTooBig`; the writer advances `cur` with a
+`cur == N` guarded `increment` (so concurrent writers all converge on the same
+next segment) and retries on the fresh segment. There is no byte estimation, no
+flush threshold, and no possibility of an unrecoverable `RecordTooBig` dropping
+an event under concurrency: segments simply roll over and pack to the
+write-block-size naturally. An append that also carries a `state_delta` coalesces
+the event `map_put` and the session/app/user state writes into one `batch_write`
+— still a single round trip.
 
 ## Next steps
 
 - [Infinite Chat History with ADK and Aerospike](https://github.com/aerospike-community/adk-aerospike/blob/main/docs/tutorials/infinite-chat-history.md) —
-  chunked session records for long agent conversations
+  append-only segment records for long agent conversations
 - [Aerospike `operate` API](https://aerospike.com/docs/develop/learn/scans-guide/#operate) —
   multi-operation atomic commands
 - [Aerospike Map operations](https://aerospike.com/docs/develop/data-types/collections/map) —

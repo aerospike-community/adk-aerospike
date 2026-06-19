@@ -46,9 +46,9 @@ Our differentiators:
 | URI parser | Implemented | `src/adk_aerospike/_internal/uri.py` |
 | Keys / schema / indexes | Implemented | `src/adk_aerospike/_internal/{keys,schema,indexes}.py` |
 | Codec helpers | Implemented (state, events, text extraction) | `src/adk_aerospike/_internal/codec.py` |
-| `create_session` / `get_session` (chunk-aware hydration, server-side last-N pagination, single-RTT `batch_read` of session + app/user state) | **Implemented + tested** | `src/adk_aerospike/sessions/service.py` |
-| `append_event` (single-record atomic, chunked tail/flush) | **Implemented + tested** | same |
-| `list_sessions` / `delete_session` (cascades all chunks + orphan) | **Implemented + tested** | same |
+| `create_session` / `get_session` (segment-walk hydration, server-side last-N pagination via K_ORDERED map ops, single-RTT `batch_read` of session + app/user state) | **Implemented + tested** | `src/adk_aerospike/sessions/service.py` |
+| `append_event` (idempotent K_ORDERED `map_put`; overflow-driven segment rollover; 1-RTT `batch_write` coalescing) | **Implemented + tested** | same |
+| `list_sessions` / `delete_session` (cascades all segments) | **Implemented + tested** | same |
 | `AerospikeArtifactService.*` (incl. `list_artifact_versions`, `get_artifact_version`) | **Implemented + tested** | `src/adk_aerospike/artifacts/service.py` |
 | `AerospikeMemoryService.*` (lexical word-overlap; posting-list PK search) | **Implemented + tested** | `src/adk_aerospike/memory/service.py` |
 | `register()` (URI schemes) | Implemented | `src/adk_aerospike/registry.py` |
@@ -63,7 +63,11 @@ Our differentiators:
 
 3. **Optional opt-in semantic memory** — if customers ask for paraphrase recall later, add a sibling `AerospikeSemanticMemoryService` that uses the Elasticsearch connector or a vendor MemoryBank. Don't fold it into the default service — keep `AerospikeMemoryService` honest as a storage-side keyword lookup.
 
-**Resolved this slice:** `append_event` atomicity (chunked tail, single-record `operate`); memory (posting-list lexical search); `list_sessions` (per-user manifest `app:user:sl` + bin-projected metadata reads).
+**Resolved this slice:** rewrote session event storage from the predictive
+chunked-tail/flush model to **overflow-driven K_ORDERED segments** (idempotent
+`map_put`, `RecordTooBig`-driven rollover, 1-RTT `batch_write` hot path) — fixes
+heavy-concurrency data loss / `RecordTooBig` and is faster (multi-scope appends
+now match single-scope latency). See `docs/design-session-segments.md`.
 
 ## Layout & key conventions
 
@@ -133,7 +137,7 @@ A `Session` returned by `get_session` is **not one row**. ADK splits it into fou
    user of an app         user's sessions
                               │
                               ▼
-                          Event[0..N]   (FK → Session, ordered by seq/timestamp)
+                          Event[0..N]   (FK → Session, ordered by timestamp)
 ```
 
 This is **Google's design**, not ours. The proof is in the SQLAlchemy schema that `DatabaseSessionService` uses — four tables, one per scope.
@@ -157,13 +161,13 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 
 | Aerospike record | Upstream object | Source citation |
 |---|---|---|
-| `adk_sessions` session record (bins `app, uid, sid, state, events (tail), ts, seq, chunks, tbytes`) | `StorageSession` + inline `events` (denormalised from `StorageEvent`) | `schemas/v1.py:72-103` |
-| `adk_sessions` chunk record (key suffix `:c:08d`, bins `cidx, events, ts_lo, ts_hi`) | Spill-over for `StorageEvent` rows — Aerospike-specific to avoid the 1 MiB write-block-size cap | no upstream parallel — our shape |
+| `adk_sessions` session record (bins `app, uid, sid, state, ts, cur`) | `StorageSession` (events live in segment records, not inline) | `schemas/v1.py:72-103` |
+| `adk_sessions` segment record (key suffix `:g:08d`, bins `gidx, events (K_ORDERED Map)`) | `StorageEvent` rows — Aerospike-specific append-only segment packing to the write-block-size cap | no upstream parallel — our shape |
 | `adk_app_state` row keyed by `"<app>"` | `StorageAppState` — one row per `(app_name)`, prefix stripped | `schemas/v1.py:233-247` + `_session_util.py:44` |
 | `adk_user_state` row keyed by `"<app>:<user>"` | `StorageUserState` — one row per `(app_name, user_id)`, prefix stripped | `schemas/v1.py:249-265` + `_session_util.py:46` |
 | `temp:*` keys absent from every record | `TEMP_PREFIX` keys are in-process only; never persisted | `state.py:66` + `_session_util.py:48` + `BaseSessionService._trim_temp_delta_state` |
 | Inline event Map inside `events` list (bins `eid, ts, author, content, actions, branch`) | `StorageEvent` row fields | `schemas/v1.py:164-191` (we store same fields in a Map element instead of a row) |
-| `seq` counter on session + atomic increment via `operate` | `_storage_update_marker` optimistic-concurrency intent — stronger here (server-side single-record atomic) | `session.py:53` PrivateAttr |
+| `cur` segment pointer on session + `cur == N` guarded `increment` on rollover | n/a — Aerospike-specific append-target pointer (replaces the dropped `seq` counter) | — |
 | `adk_artifacts` PK with `"user"` in the session slot for `user:*` filenames | `InMemoryArtifactService._artifact_path` user-namespace rule | `in_memory_artifact_service.py:56-91` |
 | `adk_memory` row per text-bearing event, scoped by `(app, uid)` | `InMemoryMemoryService._session_events[f"{app}/{user}"]` shape | `in_memory_memory_service.py` |
 | Posting-list PKs `app:user:kw:token` + memory rows → lexical match | `InMemoryMemoryService.search_memory` word-overlap matching, executed via `batch_read` on posting lists then memory rows | Inverted-index pattern on KV |
@@ -179,10 +183,10 @@ This is **Google's design**, not ours. The proof is in the SQLAlchemy schema tha
 
 **Aerospike primitives instead of SQL primitives — semantically equivalent:**
 - Composite SQL PK → `:`-separated string PK (no escaping needed; `:` is invalid in ADK identifiers)
-- 1:N FK → secondary index on `events.sid`
-- ORM ordering by `timestamp` → explicit `seq:08d` zero-padded suffix (lexicographically sortable, secondary-indexable)
-- Row-update on state delta → single-RTT atomic `map_put_items` Map CDT
-- `_storage_update_marker` revision check → server-side atomic `operate(increment(seq) + read(seq))`
+- 1:N FK (events→session) → append-only segment records under the session PK prefix
+- ORM ordering by `timestamp` → K_ORDERED map key `"{ts_micros:020d}:{event_id}"` (server-side chronological order; last-N via `map_get_by_index_range`)
+- Row-update on state delta → single-RTT atomic `map_put_items` Map CDT (coalesced with the event via `batch_write`)
+- `_storage_update_marker` revision check → idempotent `map_put` on a key that is a pure function of the event (retry-safe without a revision marker)
 - Client-side text matching → posting-list PKs per query token + `batch_read` on memory rows
 
 ### Verify this hierarchy is current
@@ -213,9 +217,8 @@ If any of these change in a future ADK release, our backend needs to follow.
 See `docs/data-model.md` for the full spec. Quick reference:
 
 Default set prefix `adk_`. Sets:
-- `adk_sessions` — key `app:user:session`, bins `app, uid, sid, state (Map), ts, seq`
-- `adk_events` — key `app:user:session:seq:08d`, bins `app, uid, sid, seq, ts, author, content, actions, branch`
-- `adk_sessions` (also holds chunks) — see "Chunked session layout" below
+- `adk_sessions` — key `app:user:session`, bins `app, uid, sid, state (Map), ts, cur`
+- `adk_sessions` (also holds event segments) — see "Segment session layout" below
 - `adk_app_state` — key `app`, bin `state (Map)`
 - `adk_user_state` — key `app:user`, bin `state (Map)`
 - `adk_artifacts` — key `app:user:session:fname:ver:08d`, bins `app, uid, sid, aus, fname, ver, mime, data, ctime, cmeta`. For `user:`-prefixed filenames, the session slot is the sentinel `"user"` (matches `InMemoryArtifactService`). `aus = "app:user:sid"` is the composite tenant index bin.
@@ -233,40 +236,50 @@ artifacts for app A, user B, session C") return only matching rows in one
 sec-index hop, instead of the sec-index-then-Python-filter pattern that
 scales linearly in unrelated tenants' rows.
 
-### Chunked session layout
+### Segment session layout
 
 The `adk_sessions` set holds **two record kinds** in one set, distinguished
 by key shape and bin presence:
 
-**Session record** (mutable, ≤ ~280 KiB):
+**Session record** (small, mutable):
 - Key: `app:user:session`
-- Bins: `app, uid, sid` (indexed for `list_sessions`), `state (Map)`, `events (List — hot tail)`, `ts`, `seq`, `chunks`, `tbytes`
+- Bins: `app, uid, sid` (indexed for `list_sessions`), `state (Map)`, `ts`, `cur`
+- `cur` is the current (append-target) segment index.
 
-**Chunk record** (immutable, ~256 KiB):
-- Key: `app:user:session:c:NNNNNNNN`
-- Bins: `cidx`, `events (List)`, `ts_lo`, `ts_hi`
+**Segment record** (append-only, packs to ~`max-record-size`):
+- Key: `app:user:session:g:NNNNNNNN`
+- Bins: `gidx`, `events` — a **K_ORDERED Map** keyed `"{ts_micros:020d}:{event_id}"` → inline event dict.
 
-Chunks deliberately omit `app/uid/sid` bins, so they don't appear in the
+Segments deliberately omit `app/uid/sid` bins, so they don't appear in the
 `idx_sess_uid` / `idx_sess_app` secondary indexes — `list_sessions` queries
 return session records only, with no client-side filter step needed.
 
-**Flush trigger:** `tbytes` (estimated tail size) ≥ 256 KiB → flush to chunk
-`c:chunks`, reset tail, bump `chunks`. Huge single events (≥ 900 KiB) are
-pre-flushed so they live alone in their own chunk.
+**Idempotent append.** The map key is a pure function of `(event.id,
+event.timestamp)`, so a retried `map_put` overwrites the same slot — an
+ambiguous-timeout retry can never duplicate an event. The key also sorts
+chronologically, so reads are server-side ordered.
 
-**Atomicity:** fast-path `append_event` is one server-side atomic `operate()`
-on the session record (list_append + increment(seq) + increment(tbytes) +
-map_put_items(state) + write(ts)). Flush is two ops: chunk PUT, then
-generation-checked `operate()` reset. Invariant for crash safety: chunk
-`c:N` is valid iff `session.chunks > N`. Any chunk at `cidx >= session.chunks`
-is an orphan from an interrupted flush and is ignored by readers; the next
-successful flush overwrites it. No data loss because the tail still holds
-events until the gen-checked reset commits.
+**Rollover (react, don't predict).** No byte estimation, no thresholds, no
+flush. Append `map_put`s into segment `cur`; the only overflow signal is a real
+`RecordTooBig`. On overflow against a non-empty segment, bump `cur` with a
+`cur == N` **guarded `increment`** (concurrent rollovers converge on the same
+next index) and retry on the new segment. A `RecordTooBig` against a freshly
+empty segment means the lone event exceeds `max-record-size` → raised (O5:
+object-store spill is future work).
 
-**Reads:** `get_session` reads the session record (fast path: tail satisfies
-`num_recent_events`). Otherwise walks chunks newest→oldest, using server-side
-`list_get_by_index_range(events, -N, N)` to fetch only the last N events of
-each chunk, and `ts_hi` pruning for `after_timestamp`.
+**Atomicity / 1-RTT hot path.** A no-state-delta append is one atomic
+`operate()` (`map_put`) on the segment. An append carrying state is one
+`batch_write` coalescing the segment `map_put` with the session/app/user `state`
+writes — one RTT regardless of scopes touched (faster than the old up-to-three
+sequential operates), with per-record results so a segment `RecordTooBig`
+surfaces while sibling state writes still commit. `cur` is cached in-process so
+the hot path never reads it; a stale cache self-heals via `RecordTooBig`. No seal
+step ⇒ no orphan/"valid iff" invariant. See `docs/tutorials/atomic-session-append.md`.
+
+**Reads:** `get_session` walks segments `cur…0` newest→oldest, using server-side
+`map_get_by_index_range(events, -N, N)` for `num_recent_events` and
+`map_get_by_key_range` from the `after_timestamp` cutoff; stops once N collected.
+`last_update_time` is the newest event's timestamp.
 
 ## Aerospike-in-Docker gotchas (learned the hard way; codified in `tests/conftest.py`)
 
