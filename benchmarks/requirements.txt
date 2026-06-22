@@ -1,6 +1,6 @@
 # Ecosystem harness (benchmarks/run.py). Not part of the PyPI package — PyPI rejects VCS deps in metadata.
 -e ..
 git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git
-google-adk-extras>=0.3
+google-adk-extras>=0.3.8
 redis>=5
 sqlalchemy>=2.0.51
