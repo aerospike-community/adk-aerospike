@@ -16,7 +16,7 @@ This tutorial requires:
 |-----------|-------------|
 | Aerospike Database | 7.x or 8.x, port 3000 (local or remote) |
 | Python | 3.11 or newer |
-| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | latest |
+| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | **0.1.0** or newer |
 | [aerospike](https://pypi.org/project/aerospike/) Python client | **19+** (`index_single_value_create` API) |
 | [google-adk](https://pypi.org/project/google-adk/) | installed automatically with adk-aerospike |
 
@@ -58,7 +58,7 @@ We recommend a virtual environment:
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip
-python -m pip install "adk-aerospike" "aerospike>=19"
+python -m pip install "adk-aerospike>=0.1.0" "aerospike>=19"
 ```
 
 `adk-aerospike` pulls in `google-adk`. Pin **`aerospike>=19`** explicitly —
@@ -154,11 +154,9 @@ session row plus app/user state and merges prefixed keys for the ADK caller.
 
 The script below walks through more of the append path in one run: several
 sequential `append_event` calls with scoped `state_delta`, a read-back of the
-merged session, then **32 concurrent writers** that each issue **500** appends
-to the same session (16,000 appends total) — spanning many segment rollovers
-with no loss or duplication. (Scale the writer count to your cluster's write
-throughput; a single under-provisioned node can return `DeviceOverload` under
-heavy concurrent load.)
+merged session, then **64 concurrent writers** that each issue **1000** appends to the same
+session (64,000 appends total), with at most four appends in flight at once so
+a single Docker CE node is not write-flooded.
 
 Save as `atomic_session_append_demo.py` and run with
 `python atomic_session_append_demo.py`.
@@ -174,8 +172,11 @@ from google.genai import types as genai_types
 from adk_aerospike import AerospikeSessionService
 
 APP, USER, SID = "demo-app", "user-1", "session-1"
-WRITERS = 32
-WRITES_PER_WRITER = 500
+WRITERS = 64
+WRITES_PER_WRITER = 1000
+MAX_IN_FLIGHT = 4
+
+sem = asyncio.Semaphore(MAX_IN_FLIGHT)
 
 
 def print_session_record(client: aerospike.Client, label: str) -> None:
@@ -188,7 +189,13 @@ def print_session_record(client: aerospike.Client, label: str) -> None:
 
 
 async def main() -> None:
-    client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
+    client = aerospike.client(
+        {
+            "hosts": [("127.0.0.1", 3000)],
+            "max_error_rate": 100,
+            "error_rate_window": 1,
+        }
+    ).connect()
     session_service = AerospikeSessionService(client, "test")
 
     session = await session_service.create_session(
@@ -228,22 +235,23 @@ async def main() -> None:
     # --- concurrent load: 64 writers × 1000 appends each ---
     async def writer(writer_id: int) -> None:
         for i in range(WRITES_PER_WRITER):
-            await session_service.append_event(
-                session,
-                Event(
-                    invocation_id=f"w{writer_id:02d}-{i:04d}",
-                    author=f"worker-{writer_id}",
-                    timestamp=time.time(),
-                    content=genai_types.Content(
-                        role="user",
-                        parts=[
-                            genai_types.Part(
-                                text=f"worker {writer_id} write {i}"
-                            )
-                        ],
+            async with sem:
+                await session_service.append_event(
+                    session,
+                    Event(
+                        invocation_id=f"w{writer_id:02d}-{i:04d}",
+                        author=f"worker-{writer_id}",
+                        timestamp=time.time(),
+                        content=genai_types.Content(
+                            role="user",
+                            parts=[
+                                genai_types.Part(
+                                    text=f"worker {writer_id} write {i}"
+                                )
+                            ],
+                        ),
                     ),
-                ),
-            )
+                )
             session.events.clear()
 
     started = time.perf_counter()
@@ -255,7 +263,8 @@ async def main() -> None:
         app_name=APP, user_id=USER, session_id=SID
     )
     print(
-        f"\n{WRITERS} writers × {WRITES_PER_WRITER} appends in {elapsed:.1f}s — "
+        f"\n{WRITERS} writers × {WRITES_PER_WRITER} appends "
+        f"(max {MAX_IN_FLIGHT} in flight) in {elapsed:.1f}s — "
         f"stored {len(final.events)} events (expected {expected})"
     )
     print_session_record(client, "after concurrent appends")
@@ -278,8 +287,8 @@ after append 1: events=2, state={'app:tenant': 'acme', 'turn': 1, 'user:locale':
 after append 4: events=5, state={'app:tenant': 'acme', 'turn': 4, 'user:locale': 'en-US'}
 after 5 sequential appends — cur_segment=0, session_state_keys=1
 
-32 writers × 500 appends in 3.1s — stored 16005 events (expected 16005)
-after concurrent appends — cur_segment=15, session_state_keys=1
+64 writers × 1000 appends (max 4 in flight) in 39.0s — stored 64005 events (expected 64005)
+after concurrent appends — cur_segment=78, session_state_keys=1
 Connection closed.
 ```
 
