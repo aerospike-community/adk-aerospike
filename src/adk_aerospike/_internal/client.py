@@ -152,6 +152,10 @@ def make_client(
     config: dict[str, Any] = {
         "hosts": list(uri.hosts),
         "policies": _merge_policies(_default_policies(), policies or {}),
+        # Stress workloads (many concurrent segment appends) can briefly trip
+        # DeviceOverload; the default client error-rate window is too tight.
+        "max_error_rate": 100,
+        "error_rate_window": 1,
     }
 
     if uri.tls or tls_config:

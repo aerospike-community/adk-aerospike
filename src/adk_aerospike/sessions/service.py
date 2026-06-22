@@ -105,8 +105,8 @@ _KEY_RANGE_END: str = ":"
 # applied. ``TimeoutError`` is ambiguous, but retrying is still safe wherever the
 # write is idempotent (the segment ``map_put`` keyed by event id+ts, the
 # guarded ``cur`` increment, ``map_put_items`` state) — a re-apply is a no-op.
-# Worst-case added latency before giving up ≈ 10+20+40+80+160 ≈ 310 ms.
-_OVERLOAD_MAX_RETRIES: int = 5
+# Worst-case added latency before giving up ≈ 10+20+40+80+160+320+640+1280+2560+5120 ≈ 10s.
+_OVERLOAD_MAX_RETRIES: int = 10
 _OVERLOAD_BASE_DELAY: float = 0.01
 _OVERLOAD_MAX_DELAY: float = 0.2
 
@@ -522,8 +522,8 @@ class AerospikeSessionService(BaseSessionService):
     ) -> Any:
         """Run a write, retrying transient back-pressure with bounded backoff.
 
-        Retries ``DeviceOverload`` always (the write was rejected, not applied)
-        and ``TimeoutError`` only when ``retry_timeout`` is set (the caller
+        Retries ``DeviceOverload`` and ``MaxErrorRateExceeded`` always (the write
+        was rejected, not applied) and ``TimeoutError`` only when ``retry_timeout`` is set (the caller
         asserts the operation is idempotent, so a possibly-applied write is safe
         to repeat). All other Aerospike errors propagate immediately.
         """
@@ -535,7 +535,7 @@ class AerospikeSessionService(BaseSessionService):
         for attempt in range(_OVERLOAD_MAX_RETRIES + 1):
             try:
                 return await asyncio.to_thread(fn, *args)
-            except ae.DeviceOverload:
+            except (ae.DeviceOverload, ae.MaxErrorRateExceeded):
                 if attempt == _OVERLOAD_MAX_RETRIES:
                     raise
             except ae.TimeoutError:
@@ -659,7 +659,7 @@ class AerospikeSessionService(BaseSessionService):
             batch = BatchRecords(writes)
             try:
                 await asyncio.to_thread(self._client.batch_write, batch)
-            except (ae.DeviceOverload, ae.TimeoutError):
+            except (ae.DeviceOverload, ae.MaxErrorRateExceeded, ae.TimeoutError):
                 if attempt == _OVERLOAD_MAX_RETRIES:
                     raise
             else:
