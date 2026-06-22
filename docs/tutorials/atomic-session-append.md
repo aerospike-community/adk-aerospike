@@ -58,7 +58,7 @@ We recommend a virtual environment:
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip
-python -m pip install "adk-aerospike==0.1.0" "aerospike>=19"
+python -m pip install "adk-aerospike>=0.1.0" "aerospike>=19"
 ```
 
 `adk-aerospike` pulls in `google-adk`. Pin **`aerospike>=19`** explicitly —
