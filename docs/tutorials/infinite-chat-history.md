@@ -2,11 +2,11 @@
 
 Long-running agent conversations accumulate thousands of events. If your session
 backend stores the full history in a single database row, you eventually hit
-Aerospike's per-record **write-block-size** limit (~1 MiB by default). Writes
+Aerospike's per-record write-block-size limit (~1 MiB by default). Writes
 fail, context is truncated, or the agent crashes mid-turn.
 
 This tutorial explains how `AerospikeSessionService` (0.1.0+) stores event
-history in **append-only segment records**: each segment is a K_ORDERED Map that
+history in append-only segment records: each segment is a K_ORDERED Map that
 packs events until Aerospike returns `RecordTooBig`, then the writer advances
 `cur` and continues on a fresh segment. Your application keeps using normal ADK
 APIs — `create_session`, `append_event`, `get_session` — with no
@@ -18,9 +18,9 @@ This tutorial requires:
 |-----------|-------------|
 | Aerospike Database | 7.x or 8.x, port 3000 (local or remote) |
 | Python | 3.11 or newer |
-| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | **>=0.1.0** |
-| [aerospike](https://pypi.org/project/aerospike/) Python client | **19+** (`index_single_value_create` API) |
-| [google-adk](https://pypi.org/project/google-adk/) | installed automatically with adk-aerospike |
+| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | 0.1.0 or newer |
+| [aerospike](https://pypi.org/project/aerospike/) Python client | 19+ (`index_single_value_create` API) |
+| [google-adk](https://pypi.org/project/google-adk/) | Installed automatically with `adk-aerospike` |
 
 This tutorial covers:
 
@@ -28,8 +28,8 @@ This tutorial covers:
   `app:user:session:g:NNNNNNNN`)
 - Overflow-driven rollover on real `RecordTooBig` (no client-side byte budget)
 - Hydrating full history vs. `num_recent_events` / `after_timestamp` reads
-  (recent-X latency is O(X), not O(total events))
-- A **20,000-turn** synthetic conversation spanning many segments
+  (recent-X latency scales with X, not total event count)
+- A 20,000-turn synthetic conversation spanning many segments
 
 ## Start Aerospike Database
 
@@ -39,14 +39,14 @@ If you do not already have a node listening on port 3000:
 docker run -d --name aerospike -p 3000:3000 aerospike/aerospike-server
 ```
 
-## Ensure the database is running
+## Verify the database is running
 
 ```bash
 nc -z localhost 3000 && echo "Aerospike database is running!" \
   || echo "**Aerospike database is not running!**"
 ```
 
-Output
+Output:
 
 ```plaintext
 Aerospike database is running!
@@ -64,8 +64,8 @@ python -m pip install --upgrade pip
 python -m pip install "adk-aerospike>=0.1.0" "aerospike>=19"
 ```
 
-`adk-aerospike` pulls in `google-adk`. Pin **`aerospike>=19`** explicitly —
-client 18.x lacks `index_single_value_create` and service construction will fail.
+`adk-aerospike` pulls in `google-adk`. Pin `aerospike>=19` explicitly —
+client 18.x lacks `index_single_value_create` and service construction fails.
 
 Verify package imports:
 
@@ -78,7 +78,7 @@ from adk_aerospike import AerospikeSessionService
 print("google-adk, aerospike, adk-aerospike imported.")
 ```
 
-Output
+Output:
 
 ```plaintext
 google-adk, aerospike, adk-aerospike imported.
@@ -94,13 +94,13 @@ session_service.close()
 print("Connected to Aerospike.")
 ```
 
-Output
+Output:
 
 ```plaintext
 Connected to Aerospike.
 ```
 
-## Connect with production defaults
+## Connect to Aerospike
 
 For real workloads, connect with `from_uri`. Segment rollover is driven by
 Aerospike's own `RecordTooBig` — there is no flush threshold to tune.
@@ -122,7 +122,7 @@ Connected with production segment layout.
 
 Modify the host, port, or namespace in the URI if your cluster differs.
 
-## Understand the session + segment layout
+## Understand the session and segment layout
 
 A session row lives in set `adk_sessions` with primary key
 `app_name:user_id:session_id`. It is small and holds only scoped state plus a
@@ -134,8 +134,8 @@ pointer to the current segment:
 | `cur` | integer | current append-target segment index (bumped on rollover) |
 | `ts` | float | `last_update_time` |
 
-Events live in **segment records** keyed `app_name:user_id:session_id:g:NNNNNNNN`,
-each a single `events` bin holding a **K_ORDERED Map**:
+Events live in segment records keyed `app_name:user_id:session_id:g:NNNNNNNN`,
+each a single `events` bin holding a K_ORDERED Map:
 
 | Bin | CDT type | Meaning |
 |-----|----------|---------|
@@ -148,7 +148,7 @@ When a `map_put` fills a segment, the writer bumps `cur` with a guarded
 
 ## Complete example
 
-The script below appends **20,000** alternating user/assistant turns (a long
+The script below appends 20,000 alternating user/assistant turns (a long
 synthetic chat), then exercises full hydration, `num_recent_events`,
 `after_timestamp`, a direct read of `cur` plus per-segment event counts, and
 `list_sessions`.
@@ -289,7 +289,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Output
+Output:
 
 ```plaintext
   appended 5000...
@@ -309,9 +309,9 @@ Connection closed.
 ```
 
 `get_session` without a config walks every segment and returns the full 20,000
-events in order (~2.8 s on a single Docker CE node for this dataset). Recent
-reads scale with **X**, not total history — Aerospike uses server-side
-`map_get_by_index_range(-N, N)` on the newest segment(s):
+events in order (~2.8 s on a single Docker Community Edition node for this dataset).
+Recent reads scale with the number of events requested, not total history —
+Aerospike uses server-side `map_get_by_index_range(-N, N)` on the newest segment(s):
 
 | `num_recent_events` | p50 latency (20k-event session) |
 |---------------------|---------------------------------|
@@ -320,7 +320,9 @@ reads scale with **X**, not total history — Aerospike uses server-side
 | 100 | ~9 ms |
 | 500 | ~51 ms |
 
-`after_timestamp` skips whole segments via `map_get_by_key_range` when their
+p50 is the median latency across repeated reads.
+
+`after_timestamp` skips whole segments with `map_get_by_key_range` when their
 keys fall below the cutoff (~2 ms for the last ten turns here).
 
 ## Next steps

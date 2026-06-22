@@ -5,8 +5,8 @@ state delta — ideally in one atomic step, without race conditions, lost writes
 or multiple round trips.
 
 This tutorial shows how `AerospikeSessionService.append_event` stores events in
-an append-only **K_ORDERED Map** segment record and coalesces any state delta
-into a single round trip. You will connect to Aerospike, append an event with a
+an append-only K_ORDERED Map segment record and coalesces any state delta
+into a single round trip. You connect to Aerospike, append an event with a
 multi-scope state delta, read back the merged session, and verify that
 concurrent appends never lose or duplicate data even as segments roll over.
 
@@ -16,9 +16,9 @@ This tutorial requires:
 |-----------|-------------|
 | Aerospike Database | 7.x or 8.x, port 3000 (local or remote) |
 | Python | 3.11 or newer |
-| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | **0.1.0** or newer |
+| [adk-aerospike](https://pypi.org/project/adk-aerospike/) | 0.1.0 or newer |
 | [aerospike](https://pypi.org/project/aerospike/) Python client | **19+** (`index_single_value_create` API) |
-| [google-adk](https://pypi.org/project/google-adk/) | installed automatically with adk-aerospike |
+| [google-adk](https://pypi.org/project/google-adk/) | Installed automatically with `adk-aerospike` |
 
 This tutorial covers:
 
@@ -36,14 +36,14 @@ If you do not already have a node listening on port 3000:
 docker run -d --name aerospike -p 3000:3000 aerospike/aerospike-server
 ```
 
-## Ensure the database is running
+## Verify the database is running
 
 ```bash
 nc -z localhost 3000 && echo "Aerospike database is running!" \
   || echo "**Aerospike database is not running!**"
 ```
 
-Output
+Output:
 
 ```plaintext
 Aerospike database is running!
@@ -61,8 +61,8 @@ python -m pip install --upgrade pip
 python -m pip install "adk-aerospike>=0.1.0" "aerospike>=19"
 ```
 
-`adk-aerospike` pulls in `google-adk`. Pin **`aerospike>=19`** explicitly —
-client 18.x lacks `index_single_value_create` and service construction will fail.
+`adk-aerospike` pulls in `google-adk`. Pin `aerospike>=19` explicitly —
+client 18.x lacks `index_single_value_create` and service construction fails.
 
 Verify package imports:
 
@@ -75,7 +75,7 @@ from adk_aerospike import AerospikeSessionService
 print("google-adk, aerospike, adk-aerospike imported.")
 ```
 
-Output
+Output:
 
 ```plaintext
 google-adk, aerospike, adk-aerospike imported.
@@ -91,13 +91,13 @@ session_service.close()
 print("Connected to Aerospike.")
 ```
 
-Output
+Output:
 
 ```plaintext
 Connected to Aerospike.
 ```
 
-## Connect with production defaults
+## Connect to Aerospike
 
 For real workloads, connect with `from_uri`. Each `append_event` is one round
 trip — a single `operate()` on the current segment when there is no state delta,
@@ -113,7 +113,7 @@ session_service = AerospikeSessionService.from_uri(
 print("Connected to Aerospike.")
 ```
 
-Output
+Output:
 
 ```plaintext
 Connected to Aerospike.
@@ -121,7 +121,7 @@ Connected to Aerospike.
 
 Modify the host, port, or namespace in the URI if your cluster differs.
 
-## Understand the session + segment layout
+## Understand the session and segment layout
 
 A session row lives in set `adk_sessions` with primary key
 `app_name:user_id:session_id`. It is small and holds only scoped state plus a
@@ -133,16 +133,16 @@ pointer to the current segment:
 | `cur` | integer | current append-target segment index (bumped on rollover) |
 | `ts` | float | `last_update_time` |
 
-Events live in **segment records** keyed `app_name:user_id:session_id:g:NNNNNNNN`,
-each a single `events` bin holding a **K_ORDERED Map**:
+Events live in segment records keyed `app_name:user_id:session_id:g:NNNNNNNN`,
+each a single `events` bin holding a K_ORDERED Map:
 
 | Bin | CDT type | Meaning |
 |-----|----------|---------|
 | `events` | Map (K_ORDERED) | `"{ts_micros:020d}:{event_id}"` → inline event Map |
 | `gidx` | integer | segment index (segments omit `app/uid/sid`, so `list_sessions` ignores them) |
 
-The map key is a pure function of the event, so a `map_put` is **idempotent** —
-a retried append overwrites the same slot and can never duplicate. The key also
+The map key is a pure function of the event, so a `map_put` is idempotent —
+a retried append overwrites the same slot and cannot duplicate. The key also
 sorts chronologically, so `get_session` reads the last N events server-side.
 
 When you call `append_event`, session-scoped, app-scoped, and user-scoped keys
@@ -154,9 +154,9 @@ session row plus app/user state and merges prefixed keys for the ADK caller.
 
 The script below walks through more of the append path in one run: several
 sequential `append_event` calls with scoped `state_delta`, a read-back of the
-merged session, then **64 concurrent writers** that each issue **1000** appends to the same
-session (64,000 appends total), with at most four appends in flight at once so
-a single Docker CE node is not write-flooded.
+merged session, then 64 concurrent writers that each issue 1000 appends to the same
+session (64,000 appends total). `MAX_IN_FLIGHT` limits concurrent appends to four
+so a single Docker Community Edition node is not write-flooded during the demo.
 
 Save as `atomic_session_append_demo.py` and run with
 `python atomic_session_append_demo.py`.
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Output
+Output:
 
 ```plaintext
 after append 0: events=1, state={'app:tenant': 'acme', 'turn': 0, 'user:locale': 'en-US'}
@@ -294,16 +294,16 @@ Connection closed.
 
 Each `append_event` does a single `map_put` of the event into the current
 segment, keyed `"{ts_micros:020d}:{event_id}"`. Because that key is a pure
-function of the event, the write is **idempotent** — a retried or duplicated
+function of the event, the write is idempotent — a retried or duplicated
 append overwrites the same slot and never produces a duplicate. When a segment
 fills, the `map_put` returns `RecordTooBig`; the writer advances `cur` with a
-`cur == N` guarded `increment` (so concurrent writers all converge on the same
+`cur == N` guarded `increment` (so concurrent writers converge on the same
 next segment) and retries on the fresh segment. There is no byte estimation, no
-flush threshold, and no possibility of an unrecoverable `RecordTooBig` dropping
-an event under concurrency: segments simply roll over and pack to the
-write-block-size naturally. An append that also carries a `state_delta` coalesces
-the event `map_put` and the session/app/user state writes into one `batch_write`
-— still a single round trip.
+flush threshold, and no unrecoverable `RecordTooBig` that drops an event under
+concurrency: segments roll over and pack to the write-block size naturally. An
+append that also carries a `state_delta` coalesces the event `map_put` and the
+session, app, and user state writes into one `batch_write` — still a single
+round trip.
 
 ## Next steps
 
