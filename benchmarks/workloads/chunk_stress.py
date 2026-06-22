@@ -1,4 +1,4 @@
-"""Long-session append path — chunk flush under sustained writes."""
+"""Long-session append path — segment rollover under sustained writes."""
 
 from __future__ import annotations
 
@@ -19,10 +19,11 @@ from ._redis_backend import (
 
 
 class ChunkStressWorkload(BaseBenchmarkWorkload):
-    """Appends to one session with a low flush threshold to force chunking.
+    """Appends to one long-running session, exercising segment rollover.
 
-    ``aerospike_session_append_chunked`` — sequential hot tail + periodic flush
-    to immutable chunk records (production long conversations).
+    ``aerospike_session_append_chunked`` — sequential appends into append-only
+    K_ORDERED segment records that roll over on overflow (production long
+    conversations). The method name is retained for benchmark-profile stability.
     """
 
     APP = "bench_eco_chunk"
@@ -38,7 +39,6 @@ class ChunkStressWorkload(BaseBenchmarkWorkload):
             redis_connection_string=redis_connection_string,
         )
         self._event_size_bytes = int(params.get("event_size_bytes", 600))
-        self._flush_threshold = int(params.get("flush_threshold_bytes", 200))
         self._svc: AerospikeSessionService | RedisSessionService | None = None
         self._session: Any = None
         self._seq = itertools.count()
@@ -47,7 +47,6 @@ class ChunkStressWorkload(BaseBenchmarkWorkload):
         if self.is_aerospike_enabled():
             assert self.aerospike_connection_string is not None
             self._svc = AerospikeSessionService.from_uri(self.aerospike_connection_string)
-            self._svc._flush_threshold = self._flush_threshold
             run_async(self._reset_session())
         elif self.is_redis_enabled():
             assert self.redis_connection_string is not None

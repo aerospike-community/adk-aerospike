@@ -1,31 +1,59 @@
 """AerospikeSessionService — Session storage backed by Aerospike KV + CDTs.
 
-Chunked storage layout
-----------------------
-All event history lives **inline on the session record** in an ``events`` List
-CDT bin (the "hot tail"). When the tail exceeds a byte threshold (default 256
-KiB), it is sealed atomically into a sibling chunk record keyed
-``<session_pk>:c:00000000`` and the tail is reset. Reads concatenate sealed
-chunks (in cidx order) with the live tail; only the chunks needed to satisfy
-``GetSessionConfig`` are fetched, using server-side ``list_get_by_index_range``
-pagination to avoid pulling whole chunks for ``num_recent_events``.
+Overflow-driven segment layout
+------------------------------
+Event history lives in append-only **segment** records keyed
+``<session_pk>:g:00000000``, ``…:g:00000001``, … Each segment holds a single
+``events`` bin: a **K_ORDERED Map** whose keys are
+``"{ts_micros:020d}:{event_id}"`` and whose values are the inline event dicts.
+The session record itself holds only scoped ``state`` plus a ``cur`` pointer to
+the segment currently being appended to.
 
-This shape pays back Aerospike's per-record overhead (~64 B PI entry + ~40 B
-record header) by ensuring high-cardinality records are KB-to-MB-scale, not
-hundreds of bytes. It also makes ``append_event`` a single-record server-side
-atomic ``operate()`` in the common case — no MRT needed.
+Two properties fall out of the key choice:
 
-Atomicity & crash safety
+- **Idempotent append.** The key is a pure function of the event, so a retried
+  ``map_put`` overwrites the same slot — a timed-out-then-retried append can
+  never duplicate an event.
+- **Cheap reads.** Because the map is key-ordered (and the key sorts
+  chronologically), ``map_get_by_index_range(-N, N)`` returns the last N events
+  server-side, and ``map_get_by_key_range`` serves ``after_timestamp``.
+
+Rollover (react, don't predict)
+-------------------------------
+``append_event`` ``map_put``s into segment ``cur``. The *only* overflow signal
+is Aerospike's own ``RecordTooBig`` — there is no client-side byte estimate, no
+threshold, no flush. On ``RecordTooBig`` the writer bumps ``cur`` with a
+``cur == N`` guarded increment (so concurrent rollovers converge on the same
+next index) and retries the ``map_put`` against the new segment. Segments thus
+pack to ~``max-record-size`` naturally, one uniform record shape.
+
+Performance: 1-RTT hot path
+---------------------------
+An append with no state delta is a single ``operate`` on the segment record. An
+append that also carries state is one ``batch_write`` coalescing the segment
+``map_put`` with the session/app/user ``state`` writes — one RTT regardless of
+how many scopes are touched (faster than the previous up-to-three sequential
+operates). ``batch_write`` reports per-record results, so a ``RecordTooBig`` on
+the segment surfaces while the sibling state writes still commit; rollover then
+re-puts only the event. ``cur`` is cached in-process so the hot path never reads
+it; a stale cache self-heals via ``RecordTooBig``.
+
+Back-pressure resilience
 ------------------------
-Fast-path append: one ``operate()`` on the session record. Naturally atomic.
+Because every hot-path write is idempotent (stable-key ``map_put``, guarded
+``cur`` increment, ``map_put_items`` state), transient back-pressure is retried
+with bounded jittered backoff: ``DeviceOverload`` (server write queue full —
+rejected, never applied) always, and ambiguous ``TimeoutError`` wherever a
+re-apply is a no-op. ``create_session`` retries ``DeviceOverload`` only, since a
+``POLICY_EXISTS_CREATE`` put is not timeout-idempotent.
 
-Flush: write chunk record (overwriting any orphan from a prior interrupted
-flush), then generation-checked ``operate()`` to clear the tail and bump the
-``chunks`` counter. If the gen check fails (another writer raced us), we leave
-our chunk write in place as an orphan — readers ignore it (invariant: chunk
-``c:N`` is valid iff ``session.chunks > N``); the next successful flush
-overwrites it. No data is ever lost because the tail still holds the events
-until the gen-checked reset succeeds.
+Crash safety
+------------
+A crash mid-append leaves a segment either updated or not (single-record atomic
+op); the stable key makes a re-append a no-op overwrite. A crash after a ``cur``
+bump but before the new segment exists is fine — the next ``map_put`` creates
+it, and readers treat a missing top segment as empty. There is no seal step and
+thus no orphan/"valid iff" invariant to maintain.
 
 State scoping
 -------------
@@ -49,25 +77,38 @@ from google.adk.sessions import BaseSessionService, Session
 
 from .._internal.client import close_client, make_client
 from .._internal.codec import (
-    estimate_event_size,
     event_from_inline_dict,
+    event_map_key,
     event_to_inline_dict,
 )
 from .._internal.indexes import ensure_session_indexes
 from .._internal.keys import (
     app_state_key,
-    chunk_key,
+    segment_key,
     session_key,
     session_manifest_key,
     user_state_key,
 )
 from .._internal.schema import (
-    DEFAULT_FLUSH_THRESHOLD_BYTES,
-    DEFAULT_HUGE_EVENT_BYTES,
     Bins,
     Schema,
     StateScope,
 )
+
+# Upper-bound sentinel for map_get_by_key_range: every event key begins with a
+# digit (0x30-0x39), so ":" (0x3A) sorts strictly after all of them and means
+# "to the end of the map". (A None upper bound returns an empty range.)
+_KEY_RANGE_END: str = ":"
+
+# Bounded backoff for transient write back-pressure. ``DeviceOverload`` (server
+# write queue full) is always safe to retry — the write was rejected, not
+# applied. ``TimeoutError`` is ambiguous, but retrying is still safe wherever the
+# write is idempotent (the segment ``map_put`` keyed by event id+ts, the
+# guarded ``cur`` increment, ``map_put_items`` state) — a re-apply is a no-op.
+# Worst-case added latency before giving up ≈ 10+20+40+80+160 ≈ 310 ms.
+_OVERLOAD_MAX_RETRIES: int = 5
+_OVERLOAD_BASE_DELAY: float = 0.01
+_OVERLOAD_MAX_DELAY: float = 0.2
 
 # list_sessions metadata only — skip events/state (can be MiB per session).
 _LIST_SESSION_BINS: tuple[str, ...] = (
@@ -99,13 +140,14 @@ class AerospikeSessionService(BaseSessionService):
         *,
         set_prefix: str = "adk_",
         ensure_indexes: bool = True,
-        flush_threshold_bytes: int = DEFAULT_FLUSH_THRESHOLD_BYTES,
-        huge_event_bytes: int = DEFAULT_HUGE_EVENT_BYTES,
     ) -> None:
         self._client = client
         self._schema = Schema(namespace=namespace, set_prefix=set_prefix)
-        self._flush_threshold = flush_threshold_bytes
-        self._huge_event_bytes = huge_event_bytes
+        # In-process cache of each session's current (append-target) segment
+        # index, keyed by session PK string. Seeded on create/get; re-read on a
+        # RecordTooBig rollover. Lets the hot path skip reading ``cur``. A stale
+        # entry (another process rolled over) self-heals via RecordTooBig.
+        self._cur_cache: dict[str, int] = {}
         if ensure_indexes:
             ensure_session_indexes(client, self._schema)
 
@@ -140,20 +182,22 @@ class AerospikeSessionService(BaseSessionService):
             Bins.USER_ID: user_id,
             Bins.SESSION_ID: session_id,
             Bins.STATE: session_state,
-            Bins.EVENTS: [],
             Bins.LAST_UPDATE: now,
-            Bins.EVENT_SEQ: 0,
-            Bins.CHUNKS: 0,
-            Bins.TAIL_BYTES: 0,
+            Bins.CUR_SEGMENT: 0,
         }
 
-        await asyncio.to_thread(
+        # retry_timeout=False: a POLICY_EXISTS_CREATE put is not idempotent under
+        # an ambiguous timeout (a re-apply would raise RecordExistsError). A
+        # DeviceOverload means it was rejected, not applied, so that is retried.
+        await self._write_retrying_overload(
             self._client.put,
             session_pk,
             session_bins,
             None,
             {"exists": aerospike.POLICY_EXISTS_CREATE},
+            retry_timeout=False,
         )
+        self._cur_cache[session_key(app_name, user_id, session_id)] = 0
 
         if app_delta:
             await self._merge_scoped_state(
@@ -214,9 +258,18 @@ class AerospikeSessionService(BaseSessionService):
         app_state = (records[app_pk] or {}).get(Bins.STATE) or {}
         user_state = (records[user_pk] or {}).get(Bins.STATE) or {}
         merged = _merge_state(app_state, user_state, session_state)
-        events = await self._load_events(
-            app_name, user_id, session_id, session_rec, config
-        )
+
+        cur = int(session_rec.get(Bins.CUR_SEGMENT, 0))
+        self._cur_cache[session_key(app_name, user_id, session_id)] = cur
+        events = await self._load_events(app_name, user_id, session_id, cur, config)
+
+        # last_update_time tracks the newest event's timestamp (matching
+        # DatabaseSessionService, which writes update_time on every append).
+        # events[-1] is the chronologically-newest (segment maps are key-ordered
+        # by ts). Fall back to the session record ts when there are no events.
+        last_update = session_rec.get(Bins.LAST_UPDATE, 0.0)
+        if events:
+            last_update = events[-1].timestamp or last_update
 
         return Session(
             id=session_id,
@@ -224,7 +277,7 @@ class AerospikeSessionService(BaseSessionService):
             user_id=user_id,
             state=merged,
             events=events,
-            last_update_time=session_rec.get(Bins.LAST_UPDATE, 0.0),
+            last_update_time=last_update,
         )
 
     async def list_sessions(
@@ -276,13 +329,13 @@ class AerospikeSessionService(BaseSessionService):
         except ae.RecordNotFound:
             return
 
-        n_chunks = int(bins.get(Bins.CHUNKS, 0))
-        # Delete sealed chunks first. Also speculatively remove cidx == n_chunks
-        # (covers orphans from an interrupted flush — see _flush_tail).
-        for cidx in range(n_chunks + 1):
-            chunk_pk = self._chunk_pk(app_name, user_id, session_id, cidx)
+        cur = int(bins.get(Bins.CUR_SEGMENT, 0))
+        # Delete segments 0..cur, plus a speculative cur+1 to reclaim a segment
+        # left by an interrupted rollover (cur bumped before the new map_put).
+        for gidx in range(cur + 2):
+            segment_pk = self._segment_pk(app_name, user_id, session_id, gidx)
             try:
-                await asyncio.to_thread(self._client.remove, chunk_pk)
+                await asyncio.to_thread(self._client.remove, segment_pk)
             except ae.RecordNotFound:
                 pass
 
@@ -291,6 +344,7 @@ class AerospikeSessionService(BaseSessionService):
         except ae.RecordNotFound:
             pass
 
+        self._cur_cache.pop(session_key(app_name, user_id, session_id), None)
         await self._manifest_remove(app_name, user_id, session_id)
 
     async def append_event(self, session: Session, event: Event) -> Event:
@@ -305,35 +359,23 @@ class AerospikeSessionService(BaseSessionService):
         session_id = session.id
         now = event.timestamp or time.time()
         event_dict = event_to_inline_dict(event)
-        est_size = estimate_event_size(event_dict)
+        ev_key = event_map_key(event.id, now)
 
         # State delta: route app/user/session parts independently.
         delta = dict(event.actions.state_delta or {})
         session_delta, app_delta, user_delta = _partition_state(delta)
 
-        if app_delta:
-            await self._merge_scoped_state(
-                self._schema.app_state_set, app_state_key(app_name), app_delta
-            )
-        if user_delta:
-            await self._merge_scoped_state(
-                self._schema.user_state_set,
-                user_state_key(app_name, user_id),
-                user_delta,
-            )
-
-        # Huge-event pre-flush: don't fold a >900 KiB event into an existing
-        # tail; seal the current tail first so this event lives alone.
-        if est_size >= self._huge_event_bytes:
-            await self._flush_tail(app_name, user_id, session_id)
-
-        new_tbytes = await self._append_to_tail(
-            app_name, user_id, session_id, event_dict, est_size, session_delta, now
+        await self._append_event_record(
+            app_name,
+            user_id,
+            session_id,
+            ev_key,
+            event_dict,
+            session_delta,
+            app_delta,
+            user_delta,
+            now,
         )
-
-        # Post-flush if tail crossed threshold (or after a huge-event append).
-        if new_tbytes >= self._flush_threshold:
-            await self._flush_tail(app_name, user_id, session_id)
 
         session.last_update_time = now
         return event
@@ -349,14 +391,37 @@ class AerospikeSessionService(BaseSessionService):
             session_key(app_name, user_id, session_id),
         )
 
-    def _chunk_pk(
-        self, app_name: str, user_id: str, session_id: str, cidx: int
+    def _segment_pk(
+        self, app_name: str, user_id: str, session_id: str, gidx: int
     ) -> tuple[str, str, str]:
         return (
             self._schema.namespace,
             self._schema.sessions_set,
-            chunk_key(app_name, user_id, session_id, cidx),
+            segment_key(app_name, user_id, session_id, gidx),
         )
+
+    async def _current_segment(
+        self, app_name: str, user_id: str, session_id: str
+    ) -> int:
+        """Current (append-target) segment index — cached, else read from the
+        session record (and cached). Defaults to 0 if the record is unreadable."""
+        from aerospike import exception as ae
+
+        pk_str = session_key(app_name, user_id, session_id)
+        cached = self._cur_cache.get(pk_str)
+        if cached is not None:
+            return cached
+        try:
+            _, _, bins = await asyncio.to_thread(
+                self._client.select,
+                self._session_pk(app_name, user_id, session_id),
+                [Bins.CUR_SEGMENT],
+            )
+            cur = int(bins.get(Bins.CUR_SEGMENT, 0))
+        except ae.RecordNotFound:
+            cur = 0
+        self._cur_cache[pk_str] = cur
+        return cur
 
     def _manifest_pk(self, app_name: str, user_id: str) -> tuple[str, str, str]:
         return (
@@ -452,220 +517,335 @@ class AerospikeSessionService(BaseSessionService):
         for session_id in session_ids:
             await self._manifest_remove(app_name, user_id, session_id)
 
-    async def _append_to_tail(
+    async def _write_retrying_overload(
+        self, fn: Any, *args: Any, retry_timeout: bool = True
+    ) -> Any:
+        """Run a write, retrying transient back-pressure with bounded backoff.
+
+        Retries ``DeviceOverload`` always (the write was rejected, not applied)
+        and ``TimeoutError`` only when ``retry_timeout`` is set (the caller
+        asserts the operation is idempotent, so a possibly-applied write is safe
+        to repeat). All other Aerospike errors propagate immediately.
+        """
+        import random
+
+        from aerospike import exception as ae
+
+        delay = _OVERLOAD_BASE_DELAY
+        for attempt in range(_OVERLOAD_MAX_RETRIES + 1):
+            try:
+                return await asyncio.to_thread(fn, *args)
+            except ae.DeviceOverload:
+                if attempt == _OVERLOAD_MAX_RETRIES:
+                    raise
+            except ae.TimeoutError:
+                if not retry_timeout or attempt == _OVERLOAD_MAX_RETRIES:
+                    raise
+            await asyncio.sleep(delay + random.uniform(0, delay))
+            delay = min(delay * 2, _OVERLOAD_MAX_DELAY)
+        raise RuntimeError("unreachable")
+
+    async def _append_event_record(
         self,
         app_name: str,
         user_id: str,
         session_id: str,
+        ev_key: str,
         event_dict: dict[str, Any],
-        est_size: int,
         session_delta: dict[str, Any],
+        app_delta: dict[str, Any],
+        user_delta: dict[str, Any],
         now: float,
-    ) -> int:
-        """Single-RTT atomic append to the tail. Returns the new ``tbytes``."""
-        from aerospike_helpers.operations import (
-            list_operations,
-            map_operations,
-            operations as ops_,
-        )
-
-        session_pk = self._session_pk(app_name, user_id, session_id)
-        ops: list[Any] = []
-        if session_delta:
-            ops.append(map_operations.map_put_items(Bins.STATE, session_delta))
-        ops.extend(
-            [
-                list_operations.list_append(Bins.EVENTS, event_dict),
-                ops_.increment(Bins.EVENT_SEQ, 1),
-                ops_.increment(Bins.TAIL_BYTES, est_size),
-                ops_.write(Bins.LAST_UPDATE, now),
-                ops_.read(Bins.TAIL_BYTES),
-            ]
-        )
-        _, _, result = await asyncio.to_thread(
-            self._client.operate, session_pk, ops
-        )
-        return int(result.get(Bins.TAIL_BYTES, 0))
-
-    async def _flush_tail(
-        self, app_name: str, user_id: str, session_id: str
     ) -> None:
-        """Seal the current tail as a chunk record; reset the tail.
+        """Persist one event (+ any state delta) in a single round trip.
 
-        Idempotent under concurrent flush attempts and crashes. Invariant: a
-        chunk record at ``cidx == N`` is *valid* only when ``session.chunks > N``;
-        any chunk written without a matching session-record reset is an orphan
-        that the next successful flush overwrites. No data is lost because the
-        tail still holds the events until the gen-checked reset commits.
+        No state delta → one ``operate`` (``map_put``) on the current segment.
+        Any state delta → one ``batch_write`` coalescing the segment ``map_put``
+        with the session/app/user ``state`` writes. ``RecordTooBig`` on the
+        segment (raised by ``operate``, or reported per-record by the batch)
+        triggers a guarded rollover and a re-put of just the event.
         """
         import aerospike
-        from aerospike import exception as ae
-        from aerospike_helpers.operations import (
-            list_operations,
-            operations as ops_,
+        from aerospike_helpers.operations import map_operations
+
+        cur = await self._current_segment(app_name, user_id, session_id)
+        mpol = {"map_order": aerospike.MAP_KEY_ORDERED}
+        seg_op = map_operations.map_put(
+            Bins.EVENTS, ev_key, event_dict, map_policy=mpol
         )
 
-        session_pk = self._session_pk(app_name, user_id, session_id)
+        if not (session_delta or app_delta or user_delta):
+            await self._place_event(app_name, user_id, session_id, cur, seg_op)
+            return
+
+        from aerospike_helpers.batch.records import BatchRecords, Write
+        from aerospike_helpers.operations import operations as ops_
+
+        seg_pk = self._segment_pk(app_name, user_id, session_id, cur)
+        writes = [Write(seg_pk, [seg_op])]
+        if session_delta:
+            writes.append(
+                Write(
+                    self._session_pk(app_name, user_id, session_id),
+                    [
+                        map_operations.map_put_items(Bins.STATE, session_delta),
+                        ops_.write(Bins.LAST_UPDATE, now),
+                    ],
+                )
+            )
+        if app_delta:
+            writes.append(
+                Write(
+                    (
+                        self._schema.namespace,
+                        self._schema.app_state_set,
+                        app_state_key(app_name),
+                    ),
+                    [map_operations.map_put_items(Bins.STATE, app_delta)],
+                )
+            )
+        if user_delta:
+            writes.append(
+                Write(
+                    (
+                        self._schema.namespace,
+                        self._schema.user_state_set,
+                        user_state_key(app_name, user_id),
+                    ),
+                    [map_operations.map_put_items(Bins.STATE, user_delta)],
+                )
+            )
+
+        # All ops in the batch are idempotent (segment map_put on a stable key;
+        # map_put_items state), so retrying the whole batch on transient
+        # back-pressure is safe.
+        results = await self._batch_write_with_retry(writes)
+
+        seg_result = results[0]
+        # Sibling state writes are independent records; a non-zero there is a
+        # genuine error worth surfacing (the segment may have succeeded).
+        for r in results[1:]:
+            if r != 0:
+                raise _batch_error(r)
+
+        if seg_result == 0:
+            self._cur_cache[session_key(app_name, user_id, session_id)] = cur
+            return
+        if seg_result == aerospike.exception.RecordTooBig().code:
+            # State already committed; roll over and place just the event.
+            await self._place_event(
+                app_name, user_id, session_id, cur, seg_op, after_overflow=True
+            )
+            return
+        raise _batch_error(seg_result)
+
+    async def _batch_write_with_retry(self, writes: list[Any]) -> list[int]:
+        """``batch_write`` with bounded retry on transient back-pressure.
+
+        Retries the whole batch on a global ``DeviceOverload``/``TimeoutError``
+        *or* a per-record ``DeviceOverload`` status (server write queue full).
+        Returns the per-record result codes; the caller interprets them
+        (``RecordTooBig`` on the segment, etc.). Safe because every op in the
+        batch is idempotent.
+        """
+        import random
+
+        from aerospike import exception as ae
+        from aerospike_helpers.batch.records import BatchRecords
+
+        overload = ae.DeviceOverload().code
+        delay = _OVERLOAD_BASE_DELAY
+        for attempt in range(_OVERLOAD_MAX_RETRIES + 1):
+            batch = BatchRecords(writes)
+            try:
+                await asyncio.to_thread(self._client.batch_write, batch)
+            except (ae.DeviceOverload, ae.TimeoutError):
+                if attempt == _OVERLOAD_MAX_RETRIES:
+                    raise
+            else:
+                results = [r.result for r in batch.batch_records]
+                if not any(r == overload for r in results):
+                    return results
+                if attempt == _OVERLOAD_MAX_RETRIES:
+                    return results
+            await asyncio.sleep(delay + random.uniform(0, delay))
+            delay = min(delay * 2, _OVERLOAD_MAX_DELAY)
+        raise RuntimeError("unreachable")
+
+    async def _place_event(
+        self,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        cur: int,
+        seg_op: Any,
+        *,
+        after_overflow: bool = False,
+    ) -> None:
+        """``map_put`` the event into segment ``cur``, rolling over on overflow.
+
+        ``RecordTooBig`` against a *non-empty* segment means it is full → bump
+        ``cur`` (guarded) and retry. ``RecordTooBig`` against an *empty* segment
+        means the event alone exceeds ``max-record-size`` — unstorable; re-raise.
+        """
+        from aerospike import exception as ae
+
+        if after_overflow:
+            cur = await self._roll_over(app_name, user_id, session_id, cur)
+
+        max_attempts = 64
+        for _ in range(max_attempts):
+            seg_pk = self._segment_pk(app_name, user_id, session_id, cur)
+            try:
+                # Idempotent map_put → safe to retry transient back-pressure.
+                await self._write_retrying_overload(
+                    self._client.operate, seg_pk, [seg_op]
+                )
+            except ae.RecordTooBig:
+                if await self._segment_size(seg_pk) == 0:
+                    raise
+                cur = await self._roll_over(app_name, user_id, session_id, cur)
+                continue
+            self._cur_cache[session_key(app_name, user_id, session_id)] = cur
+            return
+        raise RuntimeError("append did not converge after rollover retries")
+
+    async def _segment_size(self, seg_pk: tuple[str, str, str]) -> int:
+        from aerospike import exception as ae
+        from aerospike_helpers.operations import map_operations
+
         try:
-            _, meta, bins = await asyncio.to_thread(self._client.get, session_pk)
+            _, _, res = await asyncio.to_thread(
+                self._client.operate, seg_pk, [map_operations.map_size(Bins.EVENTS)]
+            )
         except ae.RecordNotFound:
-            return
+            return 0
+        return int(res.get(Bins.EVENTS, 0))
 
-        tail_events: list[dict[str, Any]] = bins.get(Bins.EVENTS) or []
-        if not tail_events:
-            return
+    async def _roll_over(
+        self, app_name: str, user_id: str, session_id: str, n: int
+    ) -> int:
+        """Advance ``cur`` from ``n`` to ``n+1`` with a ``cur == n`` guard.
 
-        cidx = int(bins.get(Bins.CHUNKS, 0))
-        gen = meta["gen"]
+        The guard makes concurrent rollovers idempotent: only the first writer
+        to observe ``cur == n`` performs the bump; the rest get ``FilteredOut``
+        and read back the already-advanced value. All callers converge on the
+        same next index, so no segment is skipped or double-claimed.
+        """
+        from aerospike import exception as ae
+        from aerospike_helpers.expressions import Eq
+        from aerospike_helpers.expressions import IntBin as _IntBin
+        from aerospike_helpers.operations import operations as ops_
 
-        ts_lo = float(tail_events[0].get("ts", 0.0))
-        ts_hi = float(tail_events[-1].get("ts", 0.0))
-
-        chunk_pk = self._chunk_pk(app_name, user_id, session_id, cidx)
-        chunk_bins = {
-            Bins.CHUNK_IDX: cidx,
-            Bins.EVENTS: tail_events,
-            Bins.TS_LO: ts_lo,
-            Bins.TS_HI: ts_hi,
-        }
-        # Plain PUT — intentionally upsert, not POLICY_EXISTS_CREATE. This is
-        # the asymmetry that makes the flush invariant work: session create
-        # rejects duplicates (POLICY_EXISTS_CREATE), but chunk PUT must
-        # overwrite any orphan left by a prior interrupted flush so the next
-        # flush can claim the same cidx cleanly. Readers ignore chunks at
-        # cidx >= session.chunks, so an orphan never appears in history; the
-        # overwrite simply reclaims its slot.
-        await asyncio.to_thread(self._client.put, chunk_pk, chunk_bins)
-
-        # Reset session tail atomically with generation check. If another
-        # writer modified the session record between our GET and this op,
-        # bail — we'll leave our chunk as an orphan; the next flush replaces
-        # it. The tail still has these events, so no loss.
-        ops = [
-            list_operations.list_clear(Bins.EVENTS),
-            ops_.increment(Bins.CHUNKS, 1),
-            ops_.write(Bins.TAIL_BYTES, 0),
-        ]
+        session_pk = self._session_pk(app_name, user_id, session_id)
+        guard = Eq(_IntBin(Bins.CUR_SEGMENT), n).compile()
         try:
-            await asyncio.to_thread(
+            # Retry-safe under back-pressure: a timed-out-then-applied increment
+            # makes the retry see cur == n+1, which fails the cur == n guard
+            # (FilteredOut) and reads the already-advanced value below.
+            _, _, res = await self._write_retrying_overload(
                 self._client.operate,
                 session_pk,
-                ops,
-                {"gen": gen},
-                {"gen": aerospike.POLICY_GEN_EQ},
+                [ops_.increment(Bins.CUR_SEGMENT, 1), ops_.read(Bins.CUR_SEGMENT)],
+                None,
+                {"expressions": guard},
             )
-        except ae.RecordGenerationError:
-            log.debug(
-                "Flush gen-check failed for session %s; orphan chunk c:%d left for next flush",
-                session_id,
-                cidx,
+            new_cur = int(res.get(Bins.CUR_SEGMENT, n + 1))
+        except ae.FilteredOut:
+            _, _, bins = await asyncio.to_thread(
+                self._client.select, session_pk, [Bins.CUR_SEGMENT]
             )
+            new_cur = int(bins.get(Bins.CUR_SEGMENT, n + 1))
+        self._cur_cache[session_key(app_name, user_id, session_id)] = new_cur
+        return new_cur
 
     async def _load_events(
         self,
         app_name: str,
         user_id: str,
         session_id: str,
-        session_bins: dict[str, Any],
+        cur: int,
         config: GetSessionConfig | None,
     ) -> list[Event]:
-        """Load events from the tail + chunks honouring ``config`` filters.
+        """Load events from segments ``cur..0`` honouring ``config`` filters.
 
-        Fast path: if the tail already satisfies ``num_recent_events``, no
-        chunk reads. Otherwise we walk chunks from newest to oldest and
-        server-side-paginate via ``list_get_by_index_range``.
+        Walk segments newest→oldest. Each segment read is server-side: a
+        ``map_get_by_index_range(-need, need)`` for ``num_recent_events`` (so we
+        never transfer more than the needed tail of a segment), or a
+        ``map_get_by_key_range`` from the ``after_timestamp`` cutoff. Stop as
+        soon as ``num_recent_events`` is satisfied or history is exhausted.
         """
-        tail: list[dict[str, Any]] = session_bins.get(Bins.EVENTS) or []
-        n_chunks = int(session_bins.get(Bins.CHUNKS, 0))
-
         num_recent = config.num_recent_events if config else None
         after_ts = config.after_timestamp if config else None
 
         if num_recent == 0:
             return []
 
-        # Collect events newest→oldest until we have enough (or exhaust history).
-        collected: list[dict[str, Any]] = []
+        collected: list[dict[str, Any]] = []  # newest → oldest
 
-        def take(events: list[dict[str, Any]]) -> bool:
-            """Append from newest end; return True if we have enough."""
-            for ev in reversed(events):
-                if after_ts is not None and float(ev.get("ts", 0.0)) < after_ts:
-                    continue
+        for gidx in range(cur, -1, -1):
+            need = (
+                (num_recent - len(collected)) if num_recent is not None else None
+            )
+            entries = await self._read_segment_entries(
+                app_name, user_id, session_id, gidx, need, after_ts
+            )
+            done = False
+            for _key, ev in reversed(entries):  # entries are ascending by key
                 collected.append(ev)
                 if num_recent is not None and len(collected) >= num_recent:
-                    return True
-            return False
-
-        if take(tail) is False and n_chunks > 0:
-            need = (num_recent - len(collected)) if num_recent is not None else None
-            for cidx in range(n_chunks - 1, -1, -1):
-                chunk_events = await self._read_chunk_events(
-                    app_name, user_id, session_id, cidx, need, after_ts
-                )
-                if take(chunk_events):
+                    done = True
                     break
-                if num_recent is not None:
-                    need = num_recent - len(collected)
+            if done:
+                break
+            # after_timestamp: once a whole segment came back empty under the
+            # cutoff, every older segment is older still — stop walking.
+            if after_ts is not None and not entries:
+                break
 
         collected.reverse()
         return [event_from_inline_dict(d) for d in collected]
 
-    async def _read_chunk_events(
+    async def _read_segment_entries(
         self,
         app_name: str,
         user_id: str,
         session_id: str,
-        cidx: int,
+        gidx: int,
         want_last_n: int | None,
         after_ts: float | None,
-    ) -> list[dict[str, Any]]:
-        """Read events from a chunk.
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return ``(key, event_dict)`` pairs from one segment, ascending by key.
 
-        - If ``want_last_n`` is set, fetch only the last N via server-side
-          ``list_get_by_index_range`` — avoids transferring an entire 256 KiB
-          chunk for a small ``num_recent_events``.
-        - If ``after_ts`` is set, prune by ``ts_hi`` first (skip chunk
-          entirely if all its events are older than the cutoff).
+        Server-side scoped: ``after_timestamp`` uses ``map_get_by_key_range``;
+        otherwise ``map_get_by_index_range`` fetches the last ``want_last_n``
+        (or the whole segment when ``want_last_n`` is None).
         """
         import aerospike
         from aerospike import exception as ae
-        from aerospike_helpers.operations import list_operations, operations as ops_
+        from aerospike_helpers.operations import map_operations
 
-        chunk_pk = self._chunk_pk(app_name, user_id, session_id, cidx)
-
+        seg_pk = self._segment_pk(app_name, user_id, session_id, gidx)
         if after_ts is not None:
-            try:
-                _, _, head = await asyncio.to_thread(
-                    self._client.select, chunk_pk, [Bins.TS_HI]
-                )
-            except ae.RecordNotFound:
-                return []
-            if float(head.get(Bins.TS_HI, 0.0)) < after_ts:
-                return []
-
-        if want_last_n is not None:
-            ops = [
-                list_operations.list_get_by_index_range(
-                    Bins.EVENTS, -want_last_n,
-                    aerospike.LIST_RETURN_VALUE, want_last_n,
-                ),
-            ]
-            try:
-                _, _, result = await asyncio.to_thread(
-                    self._client.operate, chunk_pk, ops
-                )
-            except ae.RecordNotFound:
-                return []
-            return result.get(Bins.EVENTS) or []
-
-        try:
-            _, _, bins = await asyncio.to_thread(
-                self._client.select, chunk_pk, [Bins.EVENTS]
+            lo = f"{int(after_ts * 1_000_000):020d}:"
+            op = map_operations.map_get_by_key_range(
+                Bins.EVENTS, lo, _KEY_RANGE_END, aerospike.MAP_RETURN_KEY_VALUE
             )
+        elif want_last_n is not None:
+            op = map_operations.map_get_by_index_range(
+                Bins.EVENTS, -want_last_n, want_last_n,
+                aerospike.MAP_RETURN_KEY_VALUE,
+            )
+        else:
+            op = map_operations.map_get_by_index_range(
+                Bins.EVENTS, 0, 2**31 - 1, aerospike.MAP_RETURN_KEY_VALUE
+            )
+        try:
+            _, _, res = await asyncio.to_thread(self._client.operate, seg_pk, [op])
         except ae.RecordNotFound:
             return []
-        return bins.get(Bins.EVENTS) or []
+        flat = res.get(Bins.EVENTS) or []
+        return list(zip(flat[0::2], flat[1::2], strict=True))
 
     async def _merge_scoped_state(
         self,
@@ -746,6 +926,21 @@ class AerospikeSessionService(BaseSessionService):
             else:
                 out[input_key] = None
         return out
+
+
+def _batch_error(result_code: int) -> Exception:
+    """Wrap a non-zero ``batch_write`` per-record status as an exception.
+
+    ``RecordTooBig`` is mapped to its specific type (callers may branch on it);
+    anything else surfaces as a generic ``AerospikeError`` carrying the code.
+    """
+    from aerospike import exception as ae
+
+    if result_code == ae.RecordTooBig().code:
+        return ae.RecordTooBig()
+    err = ae.AerospikeError(f"batch_write sub-operation failed (code {result_code})")
+    err.code = result_code
+    return err
 
 
 def _merge_state(

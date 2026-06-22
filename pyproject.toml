@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "adk-aerospike"
-version = "0.0.2"
+version = "0.1.0"
 description = "Aerospike-backed Session, Memory, and Artifact services for Google Agent Development Kit (ADK)."
 readme = "README.md"
 license = { text = "Apache-2.0" }

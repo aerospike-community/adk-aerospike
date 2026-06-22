@@ -32,8 +32,8 @@ log = logging.getLogger(__name__)
 def ensure_session_indexes(client: aerospike.Client, schema: Schema) -> None:
     """Create secondary indexes used by the SessionService. Idempotent.
 
-    Note: the sessions set holds both session records and chunk records.
-    Chunk records deliberately omit the ``app``/``uid``/``sid`` bins so they
+    Note: the sessions set holds both session records and segment records.
+    Segment records deliberately omit the ``app``/``uid``/``sid`` bins so they
     don't appear in these indexes. ``list_sessions(app, user)`` uses the
     ``app:user:sl`` manifest (PK + bin-projected ``batch_write`` reads), not these indexes.
     """

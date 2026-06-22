@@ -25,20 +25,6 @@ from typing import Final
 
 DEFAULT_SET_PREFIX: Final = "adk_"
 
-DEFAULT_FLUSH_THRESHOLD_BYTES: Final = 256 * 1024
-"""Tail size at which a session record flushes the hot events list to a chunk.
-
-¼ of the default Aerospike ``write-block-size`` (1 MiB) gives plenty of safety
-margin for state Map growth, retry slack, and estimator error.
-"""
-
-DEFAULT_HUGE_EVENT_BYTES: Final = 900 * 1024
-"""A single event larger than this gets flushed to its own chunk.
-
-Just below the 1 MiB write-block-size so even a huge event fits as a chunk by
-itself without bumping into the hard limit.
-"""
-
 EVENT_SCHEMA_VERSION: Final = 2
 """On-record version tag for inline event Maps (``EventFieldName.SCHEMA_VERSION``).
 
@@ -61,7 +47,7 @@ class RecordKind(StrEnum):
     """Which record shape within a set carries a bin."""
 
     SESSION = "session_record"
-    CHUNK = "chunk_record"
+    SEGMENT = "segment_record"
     APP_STATE_ROW = "app_state_row"
     USER_STATE_ROW = "user_state_row"
     ARTIFACT = "artifact_record"
@@ -76,7 +62,6 @@ class BinName(StrEnum):
     USER_ID = "uid"
     SESSION_ID = "sid"
     SCOPE_TUPLE = "aus"
-    EVENT_SEQ = "seq"
     STATE = "state"
     TIMESTAMP = "ts"
     AUTHOR = "author"
@@ -95,11 +80,8 @@ class BinName(StrEnum):
     MEM_POSTINGS = "mpl"
     SESSION_MANIFEST = "sman"
     EVENTS = "events"
-    CHUNKS = "chunks"
-    TAIL_BYTES = "tbytes"
-    CHUNK_IDX = "cidx"
-    TS_LO = "ts_lo"
-    TS_HI = "ts_hi"
+    CUR_SEGMENT = "cur"
+    SEGMENT_IDX = "gidx"
 
 
 class EventFieldName(StrEnum):
@@ -152,10 +134,10 @@ SET_REGISTRY: Final[dict[StorageSet, SetDefinition]] = {
     StorageSet.SESSIONS: SetDefinition(
         suffix=StorageSet.SESSIONS,
         full_name="sessions",
-        primary_key_shape="app:user:session  OR  app:user:session:c:NNNNNNNN",
+        primary_key_shape="app:user:session  OR  app:user:session:g:NNNNNNNN",
         purpose=(
-            "Session records (mutable hot tail) and immutable chunk records "
-            "for sealed event batches"
+            "Session records (state + cur-segment pointer) and append-only "
+            "segment records holding the event-history K_ORDERED map"
         ),
     ),
     StorageSet.APP_STATE: SetDefinition(
@@ -257,14 +239,6 @@ BIN_REGISTRY: Final[dict[BinName, BinDefinition]] = {
         _ARTIFACT | _MEMORY,
         frozenset({RecordKind.ARTIFACT, RecordKind.MEMORY}),
         'Wire value is "app:user:scope" from keys.scope_tuple(); sec-indexed for tenant-local queries',
-    ),
-    BinName.EVENT_SEQ: _bin(
-        BinName.EVENT_SEQ,
-        "event sequence counter",
-        "int",
-        _ALL_SESSION,
-        frozenset({RecordKind.SESSION}),
-        "Monotonic total events ever appended; incremented atomically on append_event",
     ),
     BinName.STATE: _bin(
         BinName.STATE,
@@ -408,51 +382,27 @@ BIN_REGISTRY: Final[dict[BinName, BinDefinition]] = {
     ),
     BinName.EVENTS: _bin(
         BinName.EVENTS,
-        "events list",
-        "List",
+        "events map",
+        "Map (K_ORDERED)",
         _ALL_SESSION,
-        frozenset({RecordKind.SESSION, RecordKind.CHUNK}),
-        "Each element is a Map (inline event shape); hot tail on session, sealed on chunk",
+        frozenset({RecordKind.SEGMENT}),
+        'Key-ordered map "{ts_micros:020d}:{eid}" -> inline event Map; on segment records',
     ),
-    BinName.CHUNKS: _bin(
-        BinName.CHUNKS,
-        "sealed chunk count",
+    BinName.CUR_SEGMENT: _bin(
+        BinName.CUR_SEGMENT,
+        "current segment index",
         "int",
         _ALL_SESSION,
         frozenset({RecordKind.SESSION}),
-        "Number of valid chunk records; equals the next chunk index to write",
+        "Highest (append-target) segment index; bumped on RecordTooBig rollover",
     ),
-    BinName.TAIL_BYTES: _bin(
-        BinName.TAIL_BYTES,
-        "tail byte estimate",
+    BinName.SEGMENT_IDX: _bin(
+        BinName.SEGMENT_IDX,
+        "segment index",
         "int",
         _ALL_SESSION,
-        frozenset({RecordKind.SESSION}),
-        "Estimated hot-tail size; flush when >= flush_threshold_bytes",
-    ),
-    BinName.CHUNK_IDX: _bin(
-        BinName.CHUNK_IDX,
-        "chunk index",
-        "int",
-        _ALL_SESSION,
-        frozenset({RecordKind.CHUNK}),
-        "Discriminator: chunk records have cidx; session records do not",
-    ),
-    BinName.TS_LO: _bin(
-        BinName.TS_LO,
-        "chunk first-event timestamp",
-        "float",
-        _ALL_SESSION,
-        frozenset({RecordKind.CHUNK}),
-        "Epoch seconds; used for after_timestamp pruning",
-    ),
-    BinName.TS_HI: _bin(
-        BinName.TS_HI,
-        "chunk last-event timestamp",
-        "float",
-        _ALL_SESSION,
-        frozenset({RecordKind.CHUNK}),
-        "Epoch seconds; used to skip whole chunks in after_timestamp reads",
+        frozenset({RecordKind.SEGMENT}),
+        "Discriminator: segment records have gidx; session records do not",
     ),
 }
 
@@ -551,7 +501,6 @@ class Bins:
     USER_ID: Final = BinName.USER_ID
     SESSION_ID: Final = BinName.SESSION_ID
     SCOPE_TUPLE: Final = BinName.SCOPE_TUPLE
-    EVENT_SEQ: Final = BinName.EVENT_SEQ
     STATE: Final = BinName.STATE
     TIMESTAMP: Final = BinName.TIMESTAMP
     LAST_UPDATE: Final = BinName.TIMESTAMP
@@ -571,11 +520,8 @@ class Bins:
     MEM_POSTINGS: Final = BinName.MEM_POSTINGS
     SESSION_MANIFEST: Final = BinName.SESSION_MANIFEST
     EVENTS: Final = BinName.EVENTS
-    CHUNKS: Final = BinName.CHUNKS
-    TAIL_BYTES: Final = BinName.TAIL_BYTES
-    CHUNK_IDX: Final = BinName.CHUNK_IDX
-    TS_LO: Final = BinName.TS_LO
-    TS_HI: Final = BinName.TS_HI
+    CUR_SEGMENT: Final = BinName.CUR_SEGMENT
+    SEGMENT_IDX: Final = BinName.SEGMENT_IDX
 
 
 class StateScope:

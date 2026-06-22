@@ -26,6 +26,43 @@ async def session_service(aerospike_uri: str) -> AsyncIterator[AerospikeSessionS
         svc.close()
 
 
+# Payload large enough that ~20 events overflow a 1 MiB segment record, so the
+# segment tests force at least one real RecordTooBig-driven rollover without
+# generating excessive test data.
+_BIG_EVENT_BYTES = 60 * 1024
+
+
+def _big_event(marker: str, *, timestamp: float | None = None):
+    """An event with a ~60 KiB text payload, tagged by ``marker``."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    kwargs: dict = dict(
+        invocation_id=marker,
+        author="user",
+        content=genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=f"{marker}:{'x' * _BIG_EVENT_BYTES}")],
+        ),
+        actions=EventActions(),
+    )
+    if timestamp is not None:
+        kwargs["timestamp"] = timestamp
+    return Event(**kwargs)
+
+
+async def _cur_segment(svc: AerospikeSessionService, app: str, user: str, sid: str) -> int:
+    """Read the session record's current-segment pointer (test introspection)."""
+    import asyncio
+
+    from adk_aerospike._internal.schema import Bins
+
+    _, _, bins = await asyncio.to_thread(
+        svc._client.select, svc._session_pk(app, user, sid), [Bins.CUR_SEGMENT]
+    )
+    return int(bins.get(Bins.CUR_SEGMENT, 0))
+
+
 async def test_create_and_get_round_trip(session_service: AerospikeSessionService) -> None:
     created = await session_service.create_session(
         app_name="testapp",
@@ -274,69 +311,86 @@ async def test_list_sessions_strips_events_and_state(
         assert s.state == {}
 
 
-async def test_chunking_flushes_on_threshold(
+async def test_appends_roll_over_to_new_segment(
     aerospike_uri: str,
 ) -> None:
-    """When the tail exceeds the flush threshold, events spill to a chunk
-    record. Hydration concatenates chunk + tail back in order."""
-    from google.adk.events import Event, EventActions
-    from google.genai import types as genai_types
-
-    # Tiny threshold + tiny huge-event cap so we trigger flush after 2-3
-    # small events instead of having to generate 256 KiB of test data.
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    """Enough large events overflow a segment record; the writer rolls over to a
+    fresh segment (driven by a real ``RecordTooBig``). History reconstructs in
+    order across the segment boundary."""
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "segapp", "u", "sg-1"
     try:
-        s = await svc.create_session(
-            app_name="chunkapp", user_id="u", session_id="ck-1"
-        )
-        # Each event payload is ~80-100 bytes estimated; ~3 events triggers
-        # flush at threshold 200.
-        for i in range(7):
-            await svc.append_event(
-                s,
-                Event(
-                    invocation_id=f"i{i}",
-                    author="user",
-                    content=genai_types.Content(
-                        role="user", parts=[genai_types.Part(text=f"msg-{i}")]
-                    ),
-                    actions=EventActions(),
-                ),
-            )
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        n = 40  # ~40 * 60 KiB = ~2.4 MiB → spans multiple 1 MiB segments
+        for i in range(n):
+            await svc.append_event(s, _big_event(f"m{i:03d}"))
+            s.events.clear()
 
-        fetched = await svc.get_session(
-            app_name="chunkapp", user_id="u", session_id="ck-1"
+        assert await _cur_segment(svc, app, user, sid) >= 1, (
+            "expected at least one rollover after ~2.4 MiB of events"
         )
+
+        fetched = await svc.get_session(app_name=app, user_id=user, session_id=sid)
         assert fetched is not None
-        texts = [e.content.parts[0].text for e in fetched.events]
-        assert texts == [f"msg-{i}" for i in range(7)]
+        markers = [e.invocation_id for e in fetched.events]
+        assert markers == [f"m{i:03d}" for i in range(n)]
     finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
         svc.close()
 
 
-async def test_chunked_session_num_recent_events_from_tail_only(
+async def test_append_is_idempotent_on_retry(
+    session_service: AerospikeSessionService,
+) -> None:
+    """A retried append of the *same* logical event (identical id + timestamp)
+    overwrites the same map slot — it must never duplicate in history.
+
+    This is the property that makes ambiguous-timeout retries safe: the segment
+    map key is a pure function of ``(event.id, event.timestamp)``."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    s = await session_service.create_session(
+        app_name="idem", user_id="u", session_id="id-1"
+    )
+
+    def make() -> Event:
+        return Event(
+            id="fixed-event-id",
+            invocation_id="inv",
+            author="user",
+            timestamp=1_000_000.5,
+            content=genai_types.Content(
+                role="user", parts=[genai_types.Part(text="hello")]
+            ),
+            actions=EventActions(),
+        )
+
+    await session_service.append_event(s, make())
+    s.events.clear()
+    await session_service.append_event(s, make())  # retry of the same event
+
+    fetched = await session_service.get_session(
+        app_name="idem", user_id="u", session_id="id-1"
+    )
+    assert fetched is not None
+    assert len(fetched.events) == 1
+    assert fetched.events[0].id == "fixed-event-id"
+
+
+async def test_num_recent_events_from_current_segment(
     aerospike_uri: str,
 ) -> None:
-    """num_recent_events small enough to be satisfied by the tail should not
-    require chunk reads."""
+    """num_recent_events small enough to be satisfied by the current segment is
+    served from that one segment."""
     from google.adk.events import Event, EventActions
     from google.adk.sessions.base_session_service import GetSessionConfig
     from google.genai import types as genai_types
 
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
     try:
         s = await svc.create_session(
-            app_name="chunkapp", user_id="u", session_id="ck-2"
+            app_name="segapp", user_id="u", session_id="sg-2"
         )
         for i in range(10):
             await svc.append_event(
@@ -352,9 +406,9 @@ async def test_chunked_session_num_recent_events_from_tail_only(
             )
         # Ask for only the last 2 — should come out as the most recent two.
         fetched = await svc.get_session(
-            app_name="chunkapp",
+            app_name="segapp",
             user_id="u",
-            session_id="ck-2",
+            session_id="sg-2",
             config=GetSessionConfig(num_recent_events=2),
         )
         assert fetched is not None
@@ -364,99 +418,67 @@ async def test_chunked_session_num_recent_events_from_tail_only(
         svc.close()
 
 
-async def test_chunked_session_num_recent_events_walks_chunks(
+async def test_num_recent_events_walks_segments(
     aerospike_uri: str,
 ) -> None:
-    """num_recent_events larger than the tail size must walk chunks back."""
-    from google.adk.events import Event, EventActions
+    """num_recent_events larger than the current segment must walk older
+    segments back across a rollover boundary."""
     from google.adk.sessions.base_session_service import GetSessionConfig
-    from google.genai import types as genai_types
 
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "segapp", "u", "sg-3"
     try:
-        s = await svc.create_session(
-            app_name="chunkapp", user_id="u", session_id="ck-3"
-        )
-        for i in range(10):
-            await svc.append_event(
-                s,
-                Event(
-                    invocation_id=f"i{i}",
-                    author="user",
-                    content=genai_types.Content(
-                        role="user", parts=[genai_types.Part(text=f"x-{i}")]
-                    ),
-                    actions=EventActions(),
-                ),
-            )
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        n = 40  # spans multiple segments
+        for i in range(n):
+            await svc.append_event(s, _big_event(f"m{i:03d}"))
+            s.events.clear()
+        assert await _cur_segment(svc, app, user, sid) >= 1
+
+        # Ask for more than fits in the newest segment so the read must walk back.
         fetched = await svc.get_session(
-            app_name="chunkapp",
-            user_id="u",
-            session_id="ck-3",
-            config=GetSessionConfig(num_recent_events=8),
+            app_name=app,
+            user_id=user,
+            session_id=sid,
+            config=GetSessionConfig(num_recent_events=30),
         )
         assert fetched is not None
-        texts = [e.content.parts[0].text for e in fetched.events]
-        assert texts == [f"x-{i}" for i in range(2, 10)]
+        markers = [e.invocation_id for e in fetched.events]
+        assert markers == [f"m{i:03d}" for i in range(n - 30, n)]
     finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
         svc.close()
 
 
-async def test_delete_chunked_session_removes_all_chunks(
+async def test_delete_multi_segment_session_removes_all_segments(
     aerospike_uri: str,
 ) -> None:
-    """delete_session removes every sealed chunk plus the session record."""
-    from google.adk.events import Event, EventActions
-    from google.genai import types as genai_types
-
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    """delete_session removes every segment record plus the session record."""
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "segapp", "u", "sg-4"
     try:
-        s = await svc.create_session(
-            app_name="chunkapp", user_id="u", session_id="ck-4"
-        )
-        for i in range(10):
-            await svc.append_event(
-                s,
-                Event(
-                    invocation_id=f"i{i}",
-                    author="user",
-                    content=genai_types.Content(
-                        role="user", parts=[genai_types.Part(text=f"d-{i}")]
-                    ),
-                    actions=EventActions(),
-                ),
-            )
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        for i in range(40):
+            await svc.append_event(s, _big_event(f"m{i:03d}"))
+            s.events.clear()
+        assert await _cur_segment(svc, app, user, sid) >= 1
 
-        await svc.delete_session(
-            app_name="chunkapp", user_id="u", session_id="ck-4"
-        )
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
 
-        fetched = await svc.get_session(
-            app_name="chunkapp", user_id="u", session_id="ck-4"
-        )
+        fetched = await svc.get_session(app_name=app, user_id=user, session_id=sid)
         assert fetched is None
 
-        # And no chunk records remain — recreating the session should give
-        # empty history.
+        # No segment records remain — recreating gives empty history.
         fresh = await svc.create_session(
-            app_name="chunkapp", user_id="u", session_id="ck-4"
+            app_name=app, user_id=user, session_id=sid
         )
         fetched2 = await svc.get_session(
-            app_name="chunkapp", user_id="u", session_id=fresh.id
+            app_name=app, user_id=user, session_id=fresh.id
         )
         assert fetched2 is not None
         assert fetched2.events == []
     finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
         svc.close()
 
 
@@ -701,136 +723,241 @@ async def test_list_sessions_isolated_per_app(
     assert "ai-B" not in ids
 
 
-async def test_list_sessions_does_not_return_chunk_records(
+async def test_list_sessions_does_not_return_segment_records(
     aerospike_uri: str,
 ) -> None:
-    """Chunks are not session rows; list_sessions (manifest path) returns one row."""
-    from google.adk.events import Event, EventActions
-    from google.genai import types as genai_types
-
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    """Segments are not session rows; list_sessions returns exactly one row even
+    for a multi-segment session (segments omit app/uid/sid → not in the index)."""
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "seglist", "u", "sl-1"
     try:
-        s = await svc.create_session(
-            app_name="chunklist", user_id="u", session_id="cl-1"
-        )
-        for i in range(10):
-            await svc.append_event(
-                s,
-                Event(
-                    invocation_id=f"i{i}",
-                    author="user",
-                    content=genai_types.Content(
-                        role="user", parts=[genai_types.Part(text=f"e-{i}")]
-                    ),
-                    actions=EventActions(),
-                ),
-            )
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        for i in range(40):  # force at least one rollover
+            await svc.append_event(s, _big_event(f"m{i:03d}"))
+            s.events.clear()
+        assert await _cur_segment(svc, app, user, sid) >= 1
 
-        resp = await svc.list_sessions(app_name="chunklist", user_id="u")
-        matching = [x for x in resp.sessions if x.id == "cl-1"]
+        resp = await svc.list_sessions(app_name=app, user_id=user)
+        matching = [x for x in resp.sessions if x.id == sid]
         assert len(matching) == 1, (
-            f"Expected exactly one session record for cl-1, got {len(matching)} — "
-            "chunks may be leaking into the sec-index"
+            f"Expected exactly one session record for {sid}, got {len(matching)} — "
+            "segments may be leaking into the sec-index"
         )
+
+        # Also via the app-only (sec-index) path.
+        resp_app = await svc.list_sessions(app_name=app)
+        assert [x for x in resp_app.sessions if x.id == sid]
     finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
         svc.close()
 
 
-async def test_huge_event_pre_flush_isolates_event_in_own_chunk(
+async def test_concurrent_append_flushes_under_write_block_size(
     aerospike_uri: str,
 ) -> None:
-    """An event whose estimated size exceeds ``huge_event_bytes`` triggers a
-    pre-flush so the existing tail seals first; the huge event then lands in
-    a fresh tail by itself. Verify history reconstructs in order."""
-    from google.adk.events import Event, EventActions
+    """Many concurrent writers on one session must not grow a record past 1 MiB."""
+    import asyncio
+    import time
+
+    from google.adk.events import Event
     from google.genai import types as genai_types
 
     svc = AerospikeSessionService(
         client=AerospikeSessionService.from_uri(aerospike_uri)._client,
         namespace="test",
-        flush_threshold_bytes=10_000,
-        huge_event_bytes=500,
     )
+    app, user, sid = "concapp", "u", "conc-1"
+    writers, per_writer = 32, 40
+    expected = writers * per_writer
     try:
-        s = await svc.create_session(
-            app_name="hugeapp", user_id="u", session_id="he-1"
-        )
-        # Small events first — they live in the tail.
-        for i in range(3):
-            await svc.append_event(
-                s,
-                Event(
-                    invocation_id=f"sm{i}",
-                    author="user",
-                    content=genai_types.Content(
-                        role="user", parts=[genai_types.Part(text=f"small-{i}")]
-                    ),
-                    actions=EventActions(),
-                ),
-            )
-        # A "huge" event whose estimated size exceeds huge_event_bytes=500.
-        # ~600 byte payload comfortably trips the threshold via str() overhead.
-        big_text = "x" * 600
-        await svc.append_event(
-            s,
-            Event(
-                invocation_id="huge",
-                author="user",
-                content=genai_types.Content(
-                    role="user", parts=[genai_types.Part(text=big_text)]
-                ),
-                actions=EventActions(),
-            ),
-        )
-        await svc.append_event(
-            s,
-            Event(
-                invocation_id="after",
-                author="user",
-                content=genai_types.Content(
-                    role="user", parts=[genai_types.Part(text="after")]
-                ),
-                actions=EventActions(),
-            ),
-        )
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
 
-        fetched = await svc.get_session(
-            app_name="hugeapp", user_id="u", session_id="he-1"
-        )
+        async def writer(writer_id: int) -> None:
+            for i in range(per_writer):
+                await svc.append_event(
+                    s,
+                    Event(
+                        invocation_id=f"w{writer_id:02d}-{i:04d}",
+                        author=f"worker-{writer_id}",
+                        timestamp=time.time(),
+                        content=genai_types.Content(
+                            role="user",
+                            parts=[
+                                genai_types.Part(
+                                    text=f"worker {writer_id} write {i}"
+                                )
+                            ],
+                        ),
+                    ),
+                )
+                s.events.clear()
+
+        await asyncio.gather(*(writer(w) for w in range(writers)))
+
+        fetched = await svc.get_session(app_name=app, user_id=user, session_id=sid)
         assert fetched is not None
-        texts = [e.content.parts[0].text for e in fetched.events]
-        assert texts == ["small-0", "small-1", "small-2", big_text, "after"]
+        assert len(fetched.events) == expected
     finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
+        svc.close()
+
+
+async def test_concurrent_large_event_appends_never_exceed_record_size(
+    aerospike_uri: str,
+) -> None:
+    """Many concurrent writers appending *large* events to one session must not
+    lose data or raise ``RecordTooBig``.
+
+    Regression for the heavy-concurrency failure: dozens of in-flight appends
+    pile large events onto one record. In the segment model each ``RecordTooBig``
+    is the rollover trigger — a guarded ``cur`` bump moves writers to a fresh
+    segment and the event is re-put idempotently. So every append lands exactly
+    once (idempotent ``map_put`` keyed by event id + timestamp) and no record
+    ever exceeds ``max-record-size``.
+    """
+    import asyncio
+    import time
+
+    from google.adk.events import Event
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "bigconc", "u", "bigconc-1"
+    writers, per_writer = 32, 40
+    expected = writers * per_writer
+    filler = "x" * (30 * 1024)
+    errors: list[str] = []
+    try:
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+
+        async def writer(writer_id: int) -> None:
+            for i in range(per_writer):
+                marker = f"w{writer_id:02d}-{i:04d}"
+                try:
+                    await svc.append_event(
+                        s,
+                        Event(
+                            invocation_id=marker,
+                            author=f"worker-{writer_id}",
+                            timestamp=time.time(),
+                            content=genai_types.Content(
+                                role="user",
+                                parts=[genai_types.Part(text=f"{marker}:{filler}")],
+                            ),
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - capture for assertion
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                s.events.clear()
+
+        await asyncio.gather(*(writer(w) for w in range(writers)))
+
+        assert not errors, f"appends raised under concurrency: {errors[:5]}"
+
+        # ~1280 events * 30 KiB ≈ 37 MiB must have rolled over many segments;
+        # a non-zero cur proves RecordTooBig was handled (never surfaced).
+        assert await _cur_segment(svc, app, user, sid) >= 1
+
+        # No loss and no duplication: every marker appears exactly once.
+        fetched = await svc.get_session(app_name=app, user_id=user, session_id=sid)
+        assert fetched is not None
+        assert len(fetched.events) == expected
+        markers = [e.invocation_id for e in fetched.events]
+        assert len(set(markers)) == expected
+    finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
+        svc.close()
+
+
+async def test_large_event_interleaved_with_small_preserves_order(
+    aerospike_uri: str,
+) -> None:
+    """Mixing large events (which trigger rollover) with small ones must not
+    disturb chronological ordering across the segment boundary."""
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "mixseg", "u", "ms-1"
+    try:
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        expected: list[str] = []
+        for i in range(50):
+            if i % 2 == 0:  # ~25 * 60 KiB = ~1.5 MiB → guarantees a rollover
+                await svc.append_event(s, _big_event(f"big{i:03d}"))
+                expected.append(f"big{i:03d}")
+            else:
+                marker = f"small{i:03d}"
+                await svc.append_event(
+                    s,
+                    Event(
+                        invocation_id=marker,
+                        author="user",
+                        content=genai_types.Content(
+                            role="user", parts=[genai_types.Part(text=marker)]
+                        ),
+                        actions=EventActions(),
+                    ),
+                )
+                expected.append(marker)
+            s.events.clear()
+
+        assert await _cur_segment(svc, app, user, sid) >= 1
+        fetched = await svc.get_session(app_name=app, user_id=user, session_id=sid)
+        assert fetched is not None
+        assert [e.invocation_id for e in fetched.events] == expected
+    finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
+        svc.close()
+
+
+async def test_oversized_single_event_raises(
+    aerospike_uri: str,
+) -> None:
+    """A lone event larger than the namespace max-record-size cannot be stored
+    inline — appending it surfaces a clear ``RecordTooBig`` (O5: blob-spill is
+    future work) rather than looping forever."""
+    from aerospike import exception as ae
+    from google.adk.events import Event, EventActions
+    from google.genai import types as genai_types
+
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
+    app, user, sid = "oversize", "u", "os-1"
+    try:
+        s = await svc.create_session(app_name=app, user_id=user, session_id=sid)
+        # > 1 MiB default max-record-size in a single event payload.
+        monster = Event(
+            invocation_id="monster",
+            author="user",
+            content=genai_types.Content(
+                role="user", parts=[genai_types.Part(text="x" * (2 * 1024 * 1024))]
+            ),
+            actions=EventActions(),
+        )
+        with pytest.raises(ae.RecordTooBig):
+            await svc.append_event(s, monster)
+    finally:
+        await svc.delete_session(app_name=app, user_id=user, session_id=sid)
         svc.close()
 
 
 async def test_after_timestamp_filter_prunes_old_events(
     aerospike_uri: str,
 ) -> None:
-    """``GetSessionConfig.after_timestamp`` drops events older than the cutoff.
-    With chunking on, this exercises the ``ts_hi`` chunk-pruning fast path."""
+    """``GetSessionConfig.after_timestamp`` drops events older than the cutoff,
+    served by a server-side ``map_get_by_key_range`` on the segment maps."""
     import time
 
     from google.adk.events import Event, EventActions
     from google.adk.sessions.base_session_service import GetSessionConfig
     from google.genai import types as genai_types
 
-    svc = AerospikeSessionService(
-        client=AerospikeSessionService.from_uri(aerospike_uri)._client,
-        namespace="test",
-        flush_threshold_bytes=200,
-        huge_event_bytes=10_000,
-    )
+    svc = AerospikeSessionService.from_uri(aerospike_uri)
     try:
         s = await svc.create_session(
             app_name="tsapp", user_id="u", session_id="ts-1"
         )
-        # Three old events with explicit small timestamps → flushed into a chunk.
+        # Four old events with explicit small timestamps.
         for i in range(4):
             await svc.append_event(
                 s,
@@ -870,8 +997,7 @@ async def test_after_timestamp_filter_prunes_old_events(
         )
         assert fetched is not None
         texts = [e.content.parts[0].text for e in fetched.events]
-        # Only the post-cutoff events survive; chunk pruning by ts_hi means
-        # we shouldn't materialise the old chunk at all.
+        # Only the post-cutoff events survive.
         assert texts == ["new-0", "new-1"]
     finally:
         svc.close()
@@ -881,7 +1007,7 @@ async def test_num_recent_events_zero_returns_empty(
     session_service: AerospikeSessionService,
 ) -> None:
     """Edge case: explicit ``num_recent_events=0`` short-circuits — we should
-    not read any chunks or the tail."""
+    not read any segments."""
     from google.adk.events import Event, EventActions
     from google.adk.sessions.base_session_service import GetSessionConfig
     from google.genai import types as genai_types
