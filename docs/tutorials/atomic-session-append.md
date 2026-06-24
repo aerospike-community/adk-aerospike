@@ -10,7 +10,7 @@ This tutorial shows that pattern end-to-end: sequential appends with multi-scope
 
 Use this tutorial when you:
 
-- Run multiple agent workers against the same session and need to verify no events are lost or duplicated
+- Run multiple agent workers against the same session and need to verify no events are lost or duplicated. A typical example is a coordinator agent that dispatches parallel sub-agents (research, retrieval, summarization) via `AgentTool`, each appending their findings to a shared session.
 - Use `state_delta` across more than one scope (`app:`, `user:`, or session-scoped keys) and need writes to land atomically
 - Want to understand how Aerospike's `RecordTooBig` drives segment rollover without any client-side estimation
 
@@ -21,7 +21,7 @@ This tutorial requires:
 | Aerospike Database | 7.x or 8.x, port 3000 (local or remote) |
 | Python | 3.11 or newer |
 | [adk-aerospike](https://pypi.org/project/adk-aerospike/) | 0.1.0 or newer |
-| [aerospike](https://pypi.org/project/aerospike/) Python client | **19+** (`index_single_value_create` API) |
+| [aerospike](https://pypi.org/project/aerospike/) Python client | 19+ (`index_single_value_create` API) |
 | [google-adk](https://pypi.org/project/google-adk/) | Installed automatically with `adk-aerospike` |
 
 This tutorial covers:
@@ -156,8 +156,7 @@ merged session, then 64 concurrent writers that each issue 1000 appends to the s
 session (64,000 appends total). `MAX_IN_FLIGHT` limits concurrent appends to four
 so a single Docker Community Edition node is not write-flooded during the demo.
 
-Save as `atomic_session_append_demo.py` and run with
-`python atomic_session_append_demo.py`.
+Save as `atomic-session-append-demo.py` and run with `python atomic-session-append-demo.py`.
 
 ```python
 import asyncio

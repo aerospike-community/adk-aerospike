@@ -151,7 +151,7 @@ synthetic chat), then exercises full hydration, `num_recent_events`,
 `after_timestamp`, a direct read of `cur` plus per-segment event counts, and
 `list_sessions`.
 
-Save as `long_chat_demo.py` and run with `python long_chat_demo.py`.
+Save as `infinite-chat-history-demo.py` and run with `python infinite-chat-history-demo.py`.
 
 ```python
 import asyncio

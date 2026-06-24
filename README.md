@@ -62,7 +62,7 @@ Start a local Aerospike container:
 docker run --rm -d --name aerospike -p 3000-3003:3000-3003 aerospike/aerospike-server:latest
 ```
 
-Then wire it into an ADK agent:
+Use it in an ADK agent:
 
 ```python
 import asyncio
@@ -136,12 +136,12 @@ async def main() -> None:
             "topic": "billing",            # session-scoped
             "app:tenant": "acme-corp",     # shared across all users of the app
             "user:nickname": "Allie",      # shared across alice's sessions
-            "temp:scratch": "throwaway",   # in-process only — never persisted
+            "temp:scratch": "throwaway",   # in-process only, never persisted
         },
     )
     print(f"session id: {session.id}")
 
-    # Append an event (one server-side atomic op — list_append + state delta + ts bump)
+    # Append an event (one server-side atomic op: map_put + state delta + ts bump)
     await svc.append_event(
         session,
         Event(
@@ -153,7 +153,7 @@ async def main() -> None:
         ),
     )
 
-    # Fetch — single batch_read across session + app_state + user_state (1 RTT)
+    # Fetch: single batch_read across session + app_state + user_state (1 RTT)
     fetched = await svc.get_session(
         app_name="support_bot", user_id="alice", session_id=session.id
     )
@@ -284,7 +284,7 @@ async def main() -> None:
     )
     await memory.add_session_to_memory(session)
 
-    # Search — batch_read posting lists per query token, union refs,
+    # Search: batch_read posting lists per query token, union refs,
     # batch_read memory rows, rank by token overlap.
     resp = await memory.search_memory(
         app_name="support_bot", user_id="alice", query="python duck typing",
@@ -356,13 +356,13 @@ pip install -e ".[dev]"
 # Unit tests only (no Docker required, ~2s)
 pytest -m "not aerospike"
 
-# Integration — explicit Aerospike CE container (matches CI)
+# Integration: explicit Aerospike CE container (matches CI)
 ./scripts/start_aerospike_ce.sh
 set -a && source .aerospike-ci.env && set +a
 pytest -m aerospike
 ./scripts/stop_aerospike_ce.sh
 
-# Integration — or let testcontainers start Aerospike for you (no script)
+# Integration: or let testcontainers start Aerospike for you (no script)
 pytest -m aerospike
 
 # Full suite (testcontainers path if env vars unset)
