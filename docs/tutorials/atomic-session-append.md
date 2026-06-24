@@ -6,7 +6,7 @@ When multiple agent workers share a session, every `append_event` call must be b
 
 This tutorial shows that pattern end-to-end: sequential appends with multi-scope state deltas, a read-back of the merged session, and 64 concurrent writers issuing 64,000 appends to a single session.
 
-## When to use this tutorial
+## When to use this pattern
 
 Use this tutorial when you:
 

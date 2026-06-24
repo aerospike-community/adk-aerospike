@@ -6,7 +6,7 @@ Long-running agent conversations accumulate thousands of events. If your session
 
 This tutorial appends a 20,000-turn synthetic conversation and shows how full hydration, `num_recent_events`, and `after_timestamp` reads all behave as history grows.
 
-## When to use this tutorial
+## When to use this pattern
 
 Use this tutorial when you:
 
