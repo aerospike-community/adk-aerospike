@@ -2,5 +2,5 @@
 -e ..
 git+https://github.com/aerospike-community/ai-ecosystem-benchmark.git
 google-adk-extras>=0.3.8
-redis>=5
+redis>=8.0.1
 sqlalchemy>=2.0.51
