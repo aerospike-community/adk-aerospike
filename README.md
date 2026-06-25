@@ -6,41 +6,32 @@ Aerospike-backed storage services for [Google Agent Development Kit (ADK)](https
 
 **Status:** alpha (0.0.2). All three ADK storage interfaces implemented end-to-end against ADK 2.x.
 
-## What's in here
+## Why this exists
+
+[Google ADK](https://adk.dev/) is a framework for building stateful, multi-step AI agents. Every agent turn generates events, state deltas, and artifacts that must survive process restarts and scale to many concurrent users. ADK defines three pluggable storage interfaces and leaves the backend to you.
+
+This package implements all three on [Aerospike](https://aerospike.com/): a real-time NoSQL database with sub-millisecond key-value access, native time to live (TTL) per record, and atomic collection data type (CDT) operations. A single Aerospike cluster backs session state, file artifacts, and lexical memory search without extra services.
+
+## Services
 
 Three implementations of ADK's pluggable storage interfaces, plus URI-scheme
 registration so the `adk` CLI can use Aerospike directly:
 
 | ADK interface         | This package               | Backed by                                                      |
 | --------------------- | -------------------------- | -------------------------------------------------------------- |
-| `BaseSessionService`  | `AerospikeSessionService`  | Aerospike KV + Map/List CDTs (chunked session records)         |
+| `BaseSessionService`  | `AerospikeSessionService`  | Aerospike KV + Map CDTs (overflow-driven segment records)      |
 | `BaseArtifactService` | `AerospikeArtifactService` | Aerospike KV (one record per version)                          |
-| `BaseMemoryService`   | `AerospikeMemoryService`   | Aerospike KV (lexical search via per-token posting-list PKs)              |
+| `BaseMemoryService`   | `AerospikeMemoryService`   | Aerospike KV (lexical search, per-token posting-list PKs)                 |
 
 ### Why use this
 
-- **All three ADK storage interfaces in one package** — Session, Artifact,
-  and Memory, backed by a single Aerospike cluster.
-- **Native in-process client.** Talks directly to Aerospike; nothing extra
-  to deploy or operate.
-- **Lexical memory search in Aerospike** — text is tokenized at write time;
-  each query token does a point read on posting-list keys
-  (`app:user:kw:<token>`), then hydrates matching memory rows. Same
-  word-overlap semantics as ADK's `InMemoryMemoryService`.
-- **Session list via per-user manifest** — `app:user:sl` holds session ids;
-  list reads metadata bins only (no full event tail over the wire).
-- **Single-record server-side atomic appends** — Aerospike Map/List CDTs let
-  `append_event` commit state delta, event append, and timestamp bump in one
-  round trip.
-- **Chunked session records** handle long event histories without hitting
-  Aerospike's `write-block-size` limit, while keeping the hot path a single
-  operation.
-- **Single round-trip `get_session`** — `batch_read` fetches the session
-  record, app-state record, and user-state record in one network call.
-- **`adk web` integration** — register the `aerospike://` URI scheme and the
-  CLI flags work out of the box.
-- **No AI/ML dependency.** Memory is a storage backend, not an embedding
-  pipeline — no embedder to wire up, no model to host.
+- All three ADK storage interfaces (Session, Artifact, Memory) backed by a single Aerospike cluster.
+- In-process client: talks directly to Aerospike with no extra services to deploy or operate.
+- Atomic `append_event`: state delta, event write, and timestamp update coalesced into one round trip.
+- Unbounded session history: events stored in overflow-driven segment records so long conversations never hit the write-block-size limit.
+- Single-RTT `get_session`: one `batch_read` across the session record, app-state record, and user-state record.
+- Lexical memory search: text tokenized at write time; each query token reads a posting-list key, then hydrates matching memory rows. Same word-overlap semantics as `InMemoryMemoryService`. No embedder needed.
+- `adk web` integration: register the `aerospike://` URI scheme and the CLI flags work without extra configuration.
 
 ## Install
 
@@ -63,15 +54,15 @@ python -c "from adk_aerospike import AerospikeSessionService; print('ok')"
 
 Release process: [RELEASING.md](RELEASING.md).
 
-## Quick start
+## Quickstart
 
-Spin up a local Aerospike container:
+Start a local Aerospike container:
 
 ```bash
 docker run --rm -d --name aerospike -p 3000-3003:3000-3003 aerospike/aerospike-server:latest
 ```
 
-Then wire it into an ADK agent:
+Use it in an ADK agent:
 
 ```python
 import asyncio
@@ -105,8 +96,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-See [`examples/quickstart.py`](examples/quickstart.py) for the complete file
-(needs a `GOOGLE_API_KEY` to actually call the model).
+See [`examples/quickstart.py`](examples/quickstart.py) for the complete file. A `GOOGLE_API_KEY` is required to call the model. To run the tutorials without an API key, see [`docs/tutorials/`](docs/tutorials/).
 
 ## Connection URIs
 
@@ -124,8 +114,8 @@ aerospike://user:pass@host1:3000,host2:3000/adk?set_prefix=prod_&tls=true
 ```
 
 Query parameters:
-- `set_prefix=adk_` — default set-name prefix (lets multiple installations share one namespace)
-- `tls=true` — enables TLS (use `tls_config=...` kwarg for mTLS details)
+- `set_prefix=adk_`: default set-name prefix (lets multiple installations share one namespace)
+- `tls=true`: enables TLS (use `tls_config=...` kwarg for mTLS details)
 
 ## Example: SessionService
 
@@ -146,12 +136,12 @@ async def main() -> None:
             "topic": "billing",            # session-scoped
             "app:tenant": "acme-corp",     # shared across all users of the app
             "user:nickname": "Allie",      # shared across alice's sessions
-            "temp:scratch": "throwaway",   # in-process only — never persisted
+            "temp:scratch": "throwaway",   # in-process only, never persisted
         },
     )
     print(f"session id: {session.id}")
 
-    # Append an event (one server-side atomic op — list_append + state delta + ts bump)
+    # Append an event (one server-side atomic op: map_put + state delta + ts bump)
     await svc.append_event(
         session,
         Event(
@@ -163,7 +153,7 @@ async def main() -> None:
         ),
     )
 
-    # Fetch — single batch_read across session + app_state + user_state (1 RTT)
+    # Fetch: single batch_read across session + app_state + user_state (1 RTT)
     fetched = await svc.get_session(
         app_name="support_bot", user_id="alice", session_id=session.id
     )
@@ -174,7 +164,7 @@ async def main() -> None:
     resp = await svc.list_sessions(app_name="support_bot", user_id="alice")
     print(f"{len(resp.sessions)} sessions")
 
-    # Delete cascades to every sealed chunk
+    # Delete cascades to all segment records
     await svc.delete_session(
         app_name="support_bot", user_id="alice", session_id=session.id
     )
@@ -263,8 +253,7 @@ asyncio.run(main())
 
 ## Example: MemoryService
 
-Lexical word-overlap search — same semantics as `InMemoryMemoryService`,
-via per-token posting-list primary keys (`app:user:kw:<token>`). No embedder.
+Lexical word-overlap search: same semantics as `InMemoryMemoryService`, using per-token posting-list primary keys (`app:user:kw:<token>`). No embedder.
 
 ```python
 import asyncio
@@ -295,7 +284,7 @@ async def main() -> None:
     )
     await memory.add_session_to_memory(session)
 
-    # Search — batch_read posting lists per query token, union refs,
+    # Search: batch_read posting lists per query token, union refs,
     # batch_read memory rows, rank by token overlap.
     resp = await memory.search_memory(
         app_name="support_bot", user_id="alice", query="python duck typing",
@@ -328,45 +317,36 @@ adk web \
   --memory_service_uri=aerospike://localhost:3000/adk
 ```
 
-## Storage shape — what ends up in Aerospike
+## Storage layout
 
 Five sets in a single namespace (default prefix `adk_`):
 
 ```
-adk_sessions      app:user:session                ← session record (state + hot tail)
-                  app:user:session:c:NNNNNNNN  ← sealed chunk record (older events)
-                  app:user:sl                    ← session-id manifest (list_sessions)
+adk_sessions      app:user:session                  ← session record (state + segment pointer)
+                  app:user:session:g:NNNNNNNN        ← segment record (events, K_ORDERED Map)
+                  app:user:sl                        ← session-id manifest (list_sessions)
 
-adk_app_state     app                                   ← one per (app)
-adk_user_state    app:user                           ← one per (app, user)
+adk_app_state     app                               ← one per (app)
+adk_user_state    app:user                          ← one per (app, user)
 
 adk_artifacts     app:user:session:fname:NNNNNNNN
-                  app:user:user:user:fname:NNNNNNNN   ← user-scoped (sentinel "user")
+                  app:user:user:user:fname:NNNNNNNN  ← user-scoped (sentinel "user")
 
-adk_memory        app:user:session:eventid       ← memory row
-                  app:user:kw:token              ← posting list ({eid,sid,ts} refs)
+adk_memory        app:user:session:eventid          ← memory row
+                  app:user:kw:token                 ← posting list ({eid,sid,ts} refs)
 ```
 
-The session record is the hot path — events accumulate in an inline List bin
-(the *hot tail*) until it reaches a 256 KiB threshold, then flush to a sealed
-chunk record. Most `append_event` calls are a single server-side atomic
-`operate()`; `get_session` is a single `batch_read` (session + app_state +
-user_state in one RTT) plus chunk reads only when the requested event
-window exceeds the tail.
+The session record is the hot path. Events accumulate in K_ORDERED Map segment records; when a segment fills, Aerospike returns `RecordTooBig` and the writer advances to the next segment. Most `append_event` calls are a single server-side atomic `operate()`; `get_session` is a single `batch_read` (session + app_state + user_state in one RTT) plus segment reads only when the requested event window spans multiple segments.
 
-For the full design (chunking, atomicity, key formats, indexes, trade-offs),
-see [`design.md`](design.md).
+For the full design (atomicity, key formats, indexes, trade-offs), see [`design.md`](design.md).
 
 ## Running tests
 
 CI runs on every push to `main` and on pull requests (see
 [`.github/workflows/tests.yml`](.github/workflows/tests.yml)):
 
-- **Unit** — `pytest -m "not aerospike"` on Python 3.11 and 3.12 (no Docker).
-- **Integration** — starts **Aerospike CE** with
-  [`scripts/start_aerospike_ce.sh`](scripts/start_aerospike_ce.sh)
-  (`docker run aerospike/aerospike-server:latest`), then `pytest -m aerospike`
-  (~4 minutes).
+- Unit: `pytest -m "not aerospike"` on Python 3.11 and 3.12 (no Docker).
+- Integration: starts Aerospike CE with [`scripts/start_aerospike_ce.sh`](scripts/start_aerospike_ce.sh) (`docker run aerospike/aerospike-server:latest`), then `pytest -m aerospike` (~4 minutes).
 
 Locally:
 
@@ -376,13 +356,13 @@ pip install -e ".[dev]"
 # Unit tests only (no Docker required, ~2s)
 pytest -m "not aerospike"
 
-# Integration — explicit Aerospike CE container (matches CI)
+# Integration: explicit Aerospike CE container (matches CI)
 ./scripts/start_aerospike_ce.sh
 set -a && source .aerospike-ci.env && set +a
 pytest -m aerospike
 ./scripts/stop_aerospike_ce.sh
 
-# Integration — or let testcontainers start Aerospike for you (no script)
+# Integration: or let testcontainers start Aerospike for you (no script)
 pytest -m aerospike
 
 # Full suite (testcontainers path if env vars unset)
@@ -391,11 +371,11 @@ pytest
 
 ## Documentation
 
-- [`design.md`](design.md) — full design document (for engineering / DevRel)
-- [`docs/data-model.md`](docs/data-model.md) — set/bin/index reference
-- [`docs/integrations.md`](docs/integrations.md) — ADK integration catalog entry
-- [`examples/`](examples/) — runnable examples, including end-to-end validation against Google's official [`adk-samples`](https://github.com/google/adk-samples) (7/7 wiring + 7/7 real-Gemini E2E — see [`examples/README.md`](examples/README.md))
-- [`CLAUDE.md`](CLAUDE.md) — auto-loaded context for Claude Code sessions
+- [`design.md`](design.md): full design document (atomicity, key formats, indexes, trade-offs)
+- [`docs/tutorials/`](docs/tutorials/): step-by-step tutorials (no API key required)
+- [`docs/data-model.md`](docs/data-model.md): set/bin/index reference
+- [`docs/integrations.md`](docs/integrations.md): ADK integration catalog entry
+- [`examples/`](examples/): runnable examples including end-to-end validation against Google's official [`adk-samples`](https://github.com/google/adk-samples) (see [`examples/README.md`](examples/README.md))
 
 ## Comparison with other ADK storage integrations
 
@@ -408,9 +388,7 @@ pytest
 | google-adk-extras | Community | ✓ SQL/Mongo/Redis | ✓ Local/S3/SQL | ✓ keyword-only | In-process |
 | Pinecone / Qdrant / Couchbase / Chroma | Vendors | ✗ | ✗ | ✗ (just tools) | MCP server |
 
-We're the only package shipping Session, Artifact, and Memory in one
-in-process Aerospike backend. Memory search is lexical word-overlap (same
-semantics as `InMemoryMemoryService`), not embedding-based.
+This is the only package shipping Session, Artifact, and Memory in one in-process Aerospike backend. Memory search is lexical word-overlap (same semantics as `InMemoryMemoryService`), not embedding-based.
 
 ## License
 

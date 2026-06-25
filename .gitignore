@@ -9,6 +9,7 @@ dist/
 *.egg
 .venv/
 venv/
+3.11+/
 .env
 .envrc
 .aerospike-ci.env
